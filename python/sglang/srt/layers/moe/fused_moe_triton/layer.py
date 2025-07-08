@@ -47,6 +47,7 @@ if _use_aiter:
 
 logger = logging.getLogger(__name__)
 
+r_weight_name = "1"
 
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
@@ -437,6 +438,9 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
         self.inplace = inplace
         self.no_combine = no_combine
+        self.prefix = prefix
+        self.layer_id = layer_id
+        self.quant_config = quant_config
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
@@ -552,9 +556,20 @@ class FusedMoE(torch.nn.Module):
             start = shard_size
         else:
             start = 0
-        expert_data = expert_data.narrow(shard_dim, start, shard_size)
-        expert_data.copy_(loaded_weight)
-
+        try:
+        # w2, down_proj: Load into only logical weight of w2.
+            expert_data = expert_data.narrow(shard_dim, start, shard_size)
+            expert_data.copy_(loaded_weight)
+        except Exception as e:
+            print(shard_dim, start, shard_size)
+            print(self.prefix, r_weight_name)
+            print(expert_data.shape)
+            print(loaded_weight.shape)
+            print(f"Error occurred: {e}")
+            print()
+            raise  # Re-raise the exception to immediately stop execution
+            
+            
     def _load_w2(
         self,
         expert_data: torch.Tensor,
@@ -569,13 +584,23 @@ class FusedMoE(torch.nn.Module):
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
 
-        if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
-            )
-
+        try:
         # w2, down_proj: Load into only logical weight of w2.
-        expert_data.copy_(loaded_weight)
+            if not self.use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * tp_rank, shard_size
+            )
+            expert_data.copy_(loaded_weight)
+        except Exception as e:
+            print(shard_dim, shard_size * tp_rank, shard_size)
+            print(self.prefix, r_weight_name)
+            print(expert_data.shape)
+            print(loaded_weight.shape)
+            print(f"Error occurred: {e}")
+            print()
+            raise  # Re-raise the exception to immediately stop execution
+            
+
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
@@ -623,6 +648,8 @@ class FusedMoE(torch.nn.Module):
         if expert_id == -1:
             return
 
+        global r_weight_name
+        r_weight_name = weight_name
         # TP rank is set to 0 if EP is enabled
         tp_rank = 0 if self.ep_size > 1 else get_tensor_model_parallel_rank()
 
@@ -719,6 +746,9 @@ class FusedMoE(torch.nn.Module):
             # FusedMoeWeightScaleSupported
             # TODO @dsikka: once hardened, refactor to use vLLM Parameters
             # specific to each case
+            if expert_id == self.num_experts - 1:
+                # expert_data.view(expert_data.shape[0] // 128, expert_data.shape[1])
+                expert_data = torch.ones(expert_data.shape[0] // self.quant_config.group_size, expert_data.shape[1], dtype=torch.float32)
             quant_method = getattr(param, "quant_method", None)
             if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust INT4 column-wise scaling number to e4m3fnuz (AMD)
@@ -770,6 +800,9 @@ class FusedMoE(torch.nn.Module):
 
         # Case model weights
         if "weight" in weight_name:
+            if expert_id == self.num_experts - 1:
+                # expert_data.view(expert_data.shape[0] // 128, expert_data.shape[1])
+                expert_data = torch.ones(expert_data.shape[0], expert_data.shape[1] * 2, dtype=torch.int8)
             self._load_model_weight_or_group_weight_scale(
                 shard_id=shard_id,
                 shard_dim=shard_dim,

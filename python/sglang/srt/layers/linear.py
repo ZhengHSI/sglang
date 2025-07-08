@@ -3,6 +3,7 @@
 import itertools
 import logging
 from abc import abstractmethod
+from math import pi
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -55,6 +56,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "ModelOptFp8LinearMethod",
     "ModelOptFp4LinearMethod",
     "IPEXAWQLinearMethod",
+    "W4BlockInt8LinearMethod"
 ]
 
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -543,7 +545,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: Optional[int] = None,
     ):
-
         # Special case for GGUF
         # initialize GGUF param after we know the quantize type
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
@@ -640,7 +641,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             if use_bitsandbytes_4bit:
                 shard_size = loaded_weight.shape[output_dim]
                 shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
-
+            
+            # print(output_dim)
+            # print(shard_offset)
+            # print(shard_size)
+            # print(param_data.shape)
+            # print(param_data)
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
             # bitsandbytes loads the weights of the specific portion
@@ -1187,7 +1193,7 @@ class RowParallelLinear(LinearBase):
 
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
-
+        self.prefix = prefix
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
             tp_rank = get_tensor_model_parallel_rank()
@@ -1277,6 +1283,7 @@ class RowParallelLinear(LinearBase):
         if isinstance(param, RowvLLMParameter):
             # This `BasevLLMParameter` is defined in sglang/srt/layers/parameter.py,
             # It supports additional parameters like tp_rank and use_presharded_weights.
+            # print(self.prefix)
             param.load_row_parallel_weight(
                 loaded_weight,
                 tp_rank=self.tp_rank,
