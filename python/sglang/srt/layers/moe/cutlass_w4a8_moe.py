@@ -91,6 +91,7 @@ def cutlass_w4a8_moe(
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
     assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
     assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
+    # print(w1_scale.shape, w1_q.shape)
     assert (
         w1_scale.shape[1] == w1_q.shape[2] * 2 / 512
         and w1_scale.shape[2] == w1_q.shape[1] * 4

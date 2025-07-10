@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 from torch.nn import Module
+from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -118,11 +119,13 @@ class MixedPrecisionW4Config(QuantizationConfig):
                 # print("unquant", layer_class_name, prefix)
                 return UnquantizedLinearMethod()
             else:
+                # print("LinearBase", prefix)
                 # Use block INT8 for non-expert layers
                 # print("W8Linear ", layer_class_name, prefix)
                 return W4BlockInt8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             # print(prefix, layer.layer_id)
+            # print("FusedMoE", prefix)
             if "shared_experts" in prefix:
         #     # Lazy import to avoid circular dependency
                 # print("W8moe ",layer_class_name,  prefix)
@@ -196,7 +199,7 @@ class W4MoEMethod(QuantizeMethodBase):
             data=torch.empty(
                 num_experts, 
                 2 * intermediate_size_per_partition, 
-                hidden_size // self.quant_config.pack_factor, 
+                hidden_size // 2, 
                 dtype=torch.int8  # INT4 packed into INT8
             ),
             requires_grad=False,
@@ -210,7 +213,7 @@ class W4MoEMethod(QuantizeMethodBase):
             data=torch.empty(
                 num_experts, 
                 hidden_size, 
-                intermediate_size_per_partition // self.quant_config.pack_factor, 
+                intermediate_size_per_partition // 2, 
                 dtype=torch.int8  # INT4 packed into INT8
             ),
             requires_grad=False,
@@ -246,9 +249,109 @@ class W4MoEMethod(QuantizeMethodBase):
         # Fix: Set proper quantization method for weight loading
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Weights are already processed during loading
+        # Input scales
+        w13_input_scale = torch.nn.Parameter(
+            torch.ones((num_experts, 2), dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_input_scale", w13_input_scale)
+        set_weight_attrs(w13_input_scale, extra_weight_attrs)
+
+        w2_input_scale = torch.nn.Parameter(
+            torch.ones(num_experts, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_input_scale", w2_input_scale)
+        set_weight_attrs(w2_input_scale, extra_weight_attrs)
+
+        # Pre-populate the strides
+        device = layer.w13_weight.device
+
+        self.a_strides1 = torch.full(
+            (num_experts, 3),
+            hidden_size,
+            device=device,
+            dtype=torch.int64,
+        )
+        self.c_strides1 = torch.full(
+            (num_experts, 3),
+            2 * intermediate_size_per_partition,
+            device=device,
+            dtype=torch.int64,
+        )
+        self.a_strides2 = torch.full(
+            (num_experts, 3),
+            intermediate_size_per_partition,
+            device=device,
+            dtype=torch.int64,
+        )
+        self.c_strides2 = torch.full(
+            (num_experts, 3),
+            hidden_size,
+            device=device,
+            dtype=torch.int64,
+        )
+        self.b_strides1 = self.a_strides1
+        self.s_strides13 = self.c_strides1
+        self.b_strides2 = self.a_strides2
+        self.s_strides2 = self.c_strides2
+
+        self.expert_offsets = torch.empty(
+            (num_experts + 1), dtype=torch.int32, device=device
+        )
+        self.problem_sizes1 = torch.empty(
+            (num_experts, 3), dtype=torch.int32, device=device
+        )
+        self.problem_sizes2 = torch.empty(
+            (num_experts, 3), dtype=torch.int32, device=device
+        )
+
         return
+
+    def _interleave_scales(self, scales: torch.Tensor) -> torch.Tensor:
+        """Interleave scales in groups of 4 similar to TRT-LLM implementation."""
+        s_shape = scales.shape
+        # print(s_shape)
+        # Reshape to separate groups of 4
+        scales_interleaved = scales.reshape(
+            s_shape[0], s_shape[1], (s_shape[2] // 4), 4
+        )
+        # Permute dimensions to interleave
+        scales_interleaved = scales_interleaved.permute(0, 2, 1, 3)
+        # Reshape back to original dimensions but with interleaved values
+        scales_interleaved = scales_interleaved.reshape(
+            s_shape[0], s_shape[2] // 4, s_shape[1] * 4
+        )
+        return scales_interleaved.contiguous()
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        dtype = torch.bfloat16
+        device = layer.w2_weight.device
+
+        # Interleave w13_weight_scale (gate_up_proj)
+        w13_weight_scale = layer.w13_weight_scale_inv.to(dtype)
+        w13_weight_scale = self._interleave_scales(w13_weight_scale)
+        layer.w13_weight_scale_inv = Parameter(w13_weight_scale, requires_grad=False)
+
+        # Interleave w2_weight_scale (down_proj)
+        w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
+        w2_weight_scale = self._interleave_scales(w2_weight_scale)
+        layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
+
+        # Process input scales
+        w13_input_scale_max = layer.w13_input_scale.max().to(dtype).item()
+        new_w13_input_scale = torch.tensor(
+            [w13_input_scale_max],
+            dtype=dtype,
+            device=device,
+        )
+        layer.w13_input_scale = Parameter(new_w13_input_scale, requires_grad=False)
+
+        w2_input_scale_max = layer.w2_input_scale.max().to(dtype).item()
+        new_w2_input_scale = torch.tensor(
+            [w2_input_scale_max], dtype=dtype, device=device
+        )
+        layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 
     def apply(
         self,

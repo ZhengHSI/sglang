@@ -2459,6 +2459,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     name = name.replace(weight_name, param_name)
                     param = params_dict[name]
                     weight_loader = param.weight_loader
+                    # print(name)
                     weight_loader(
                         param,
                         loaded_weight,

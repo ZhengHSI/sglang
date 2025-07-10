@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_quant_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
+from sglang.srt.layers.quantization.mixed_precision_w4 import MixedPrecisionW4Config, W4MoEMethod
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -231,6 +232,16 @@ class EPMoE(torch.nn.Module):
             self.w13_weight_scale = None
             self.w2_weight_scale = None
             self.activation_scheme = quant_config.moe_activation_scheme
+        elif isinstance(quant_config, MixedPrecisionW4Config):
+            self.quant_method: Optional[QuantizeMethodBase] = W4MoEMethod(
+                quant_config
+            )
+            self.use_fp8_w8a8 = False
+            self.fp8_dtype = torch.float8_e4m3fn
+            self.use_block_quant = False
+            self.activation_scheme = quant_config.activation_scheme
+            self.use_w4afp8 = False
+            self.use_w4aint8 = True
         else:
             self.quant_method: Optional[QuantizeMethodBase] = Fp8EPMoEMethod(
                 quant_config
@@ -246,29 +257,40 @@ class EPMoE(torch.nn.Module):
             self.activation_scheme = quant_config.activation_scheme
             self.use_w4afp8 = False
 
-        self.quant_method.create_weights(
-            layer=self,
-            num_experts_per_partition=self.num_experts_per_partition,
-            hidden_size=hidden_size,
-            intermediate_size=self.intermediate_size,
-            params_dtype=params_dtype,
-            weight_loader=self.weight_loader,
-        )
+        if isinstance(self.quant_method, W4MoEMethod):
+            self.quant_method.create_weights(
+                layer=self,
+                num_experts=self.num_experts_per_partition,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=self.intermediate_size,
+                params_dtype=params_dtype,
+                weight_loader=self.weight_loader,
+            )
+        else:
+            self.quant_method.create_weights(
+                layer=self,
+                num_experts_per_partition=self.num_experts_per_partition,
+                hidden_size=hidden_size,
+                intermediate_size=self.intermediate_size,
+                params_dtype=params_dtype,
+                weight_loader=self.weight_loader,
+            )
 
         self.grouped_gemm_runner = None
 
-        self.w13_weight_fp8 = (
-            self.w13_weight,
-            (
-                self.w13_weight_scale_inv
-                if self.use_block_quant
-                else self.w13_weight_scale
-            ),
-        )
-        self.w2_weight_fp8 = (
-            self.w2_weight,
-            self.w2_weight_scale_inv if self.use_block_quant else self.w2_weight_scale,
-        )
+        if not self.use_w4aint8:
+            self.w13_weight_fp8 = (
+                self.w13_weight,
+                (
+                    self.w13_weight_scale_inv
+                    if self.use_block_quant
+                    else self.w13_weight_scale
+                ),
+            )
+            self.w2_weight_fp8 = (
+                self.w2_weight,
+                self.w2_weight_scale_inv if self.use_block_quant else self.w2_weight_scale,
+            )
 
     # Adapted from https://github.com/vllm-project/vllm/blob/9fb52e523abf7bdaf7e60cf2971edb5a1b13dc08/vllm/model_executor/layers/fused_moe/layer.py#L544C1-L586C43
     # Modifications: use determine_expert_map as a class internal function, set 'global_num_experts' rather than '-1' for experts not assigned to the current rank.
@@ -501,6 +523,44 @@ class EPMoE(torch.nn.Module):
         )
 
         if self.use_w4afp8:
+            local_topk_ids = topk_ids
+            if self.expert_map is not None:
+                "Translate info from expert_map to topk_ids"
+                local_topk_ids = torch.where(
+                    self.expert_map[topk_ids] != self.num_experts,
+                    self.expert_map[topk_ids],
+                    self.num_experts,
+                )
+
+            output = cutlass_w4a8_moe(
+                self.start_expert_id,
+                self.end_expert_id,
+                self.num_experts,
+                hidden_states,
+                self.w13_weight,
+                self.w2_weight,
+                self.w13_weight_scale_inv,
+                self.w2_weight_scale_inv,
+                topk_weights,
+                topk_ids,
+                local_topk_ids,
+                self.quant_method.a_strides1,
+                self.quant_method.b_strides1,
+                self.quant_method.c_strides1,
+                self.quant_method.a_strides2,
+                self.quant_method.b_strides2,
+                self.quant_method.c_strides2,
+                self.quant_method.s_strides13,
+                self.quant_method.s_strides2,
+                self.quant_method.expert_offsets,
+                self.quant_method.problem_sizes1,
+                self.quant_method.problem_sizes2,
+                self.w13_input_scale,
+                self.w2_input_scale,
+            )
+            return output
+
+        if self.use_w4aint8:
             local_topk_ids = topk_ids
             if self.expert_map is not None:
                 "Translate info from expert_map to topk_ids"
@@ -828,6 +888,8 @@ class EPMoE(torch.nn.Module):
             )
             return
 
+        # print(weight_name)
+        # print(loaded_weight.shape)
         if shard_id == "w2":
             param.data[expert_id] = loaded_weight
         elif shard_id == "w1":
@@ -883,7 +945,7 @@ class EPMoE(torch.nn.Module):
                     ] = loaded_weight
                 else:  # w2
                     param_data[expert_id] = loaded_weight
-            elif self.use_w4afp8:
+            elif self.use_w4afp8 or self.use_w4aint8:
                 if shard_id == "w1":
                     param_data[expert_id][: self.intermediate_size, :] = loaded_weight
                 elif shard_id == "w3":
