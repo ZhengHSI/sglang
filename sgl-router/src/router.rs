@@ -180,7 +180,15 @@ impl Router {
             }
             _ => {
                 // Wait until all workers are healthy for regular modes
-                Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs)?;
+                let worker_urls = worker_urls.clone();
+                std::thread::spawn(move || {
+                    Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs)
+                })
+                .join()
+                .map_err(|e| {
+                    error!("Health-check thread panicked: {:?}", e);
+                    format!("Health-check thread panicked: {e:?}")
+                })??;
             }
         }
 
@@ -834,6 +842,8 @@ impl Router {
                 if let Ok(mut queue) = running_queue.lock() {
                     if let Some(count) = queue.get_mut(worker_url) {
                         *count = count.saturating_sub(1);
+                        gauge!("sgl_router_running_requests", "worker" => worker_url.to_string())
+                            .set(*count as f64);
                     }
                 }
             }
@@ -866,6 +876,7 @@ impl Router {
                                 let mut locked_queue = running_queue.lock().unwrap();
                                 let count = locked_queue.get_mut(&worker_url).unwrap();
                                 *count = count.saturating_sub(1);
+                                gauge!("sgl_router_running_requests", "worker" => worker_url.to_string()).set(*count as f64);
                                 debug!("Streaming is done!!")
                             }
                         }),

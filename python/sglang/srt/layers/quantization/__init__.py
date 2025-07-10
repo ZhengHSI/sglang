@@ -69,6 +69,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.mixed_precision_w4 import MixedPrecisionW4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
+from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
@@ -84,6 +85,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "mixed_precision_w4": MixedPrecisionW4Config,
     "compressed-tensors": CompressedTensorsConfig,
     "qoq": QoQConfig,
+    "w4afp8": W4AFp8Config,
 }
 
 # VLLM-dependent quantization methods
