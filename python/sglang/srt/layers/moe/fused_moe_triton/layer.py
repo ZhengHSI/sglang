@@ -746,7 +746,7 @@ class FusedMoE(torch.nn.Module):
             # FusedMoeWeightScaleSupported
             # TODO @dsikka: once hardened, refactor to use vLLM Parameters
             # specific to each case
-            if expert_id == self.num_experts - 1:
+            if expert_id < self.num_experts and expert_id >= self.num_experts - self.num_fused_shared_experts and self.num_fused_shared_experts != 0:
                 # expert_data.view(expert_data.shape[0] // 128, expert_data.shape[1])
                 expert_data = torch.ones(expert_data.shape[0] // self.quant_config.group_size, expert_data.shape[1], dtype=torch.float32)
             quant_method = getattr(param, "quant_method", None)
@@ -800,7 +800,7 @@ class FusedMoE(torch.nn.Module):
 
         # Case model weights
         if "weight" in weight_name:
-            if expert_id == self.num_experts - 1:
+            if expert_id < self.num_experts and expert_id >= self.num_experts - self.num_fused_shared_experts and self.num_fused_shared_experts != 0:
                 # expert_data.view(expert_data.shape[0] // 128, expert_data.shape[1])
                 expert_data = torch.ones(expert_data.shape[0], expert_data.shape[1] * 2, dtype=torch.int8)
             self._load_model_weight_or_group_weight_scale(

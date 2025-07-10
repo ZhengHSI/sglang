@@ -757,15 +757,21 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
             shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
 
-        param.load_merged_column_weight(
-            loaded_weight=loaded_weight,
-            shard_id=loaded_shard_id,
-            shard_offset=shard_offset,
-            shard_size=shard_size,
-            use_presharded_weights=self.use_presharded_weights,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-        )
+        try:
+            param.load_merged_column_weight(
+                loaded_weight=loaded_weight,
+                shard_id=loaded_shard_id,
+                shard_offset=shard_offset,
+                shard_size=shard_size,
+                use_presharded_weights=self.use_presharded_weights,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+            )
+        except:
+            print(loaded_weight.shape)
+            print(loaded_shard_id)
+            print(shard_offset)
+            print(shard_size)
 
 
 class QKVParallelLinear(ColumnParallelLinear):
