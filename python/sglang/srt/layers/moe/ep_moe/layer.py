@@ -221,6 +221,7 @@ class EPMoE(torch.nn.Module):
             self.block_shape = None
             self.activation_scheme = None
             self.use_w4afp8 = False
+            self.use_w4aint8 = False
         elif isinstance(quant_config, W4AFp8Config):
             self.quant_method: Optional[QuantizeMethodBase] = W4AFp8MoEMethod(
                 quant_config
@@ -231,6 +232,7 @@ class EPMoE(torch.nn.Module):
             self.fp8_dtype = torch.float8_e4m3fn
             self.w13_weight_scale = None
             self.w2_weight_scale = None
+            self.use_w4aint8 = False
             self.activation_scheme = quant_config.moe_activation_scheme
         elif isinstance(quant_config, MixedPrecisionW4Config):
             self.quant_method: Optional[QuantizeMethodBase] = W4MoEMethod(
@@ -256,6 +258,7 @@ class EPMoE(torch.nn.Module):
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
             self.use_w4afp8 = False
+            self.use_w4aint8 = False
 
         if isinstance(self.quant_method, W4MoEMethod):
             self.quant_method.create_weights(
@@ -531,7 +534,6 @@ class EPMoE(torch.nn.Module):
                     self.expert_map[topk_ids],
                     self.num_experts,
                 )
-
             output = cutlass_w4a8_moe(
                 self.start_expert_id,
                 self.end_expert_id,
@@ -618,6 +620,7 @@ class EPMoE(torch.nn.Module):
                 else hidden_states.dtype
             ),
         )
+
         if self.activation_scheme == "dynamic" and not self.use_block_quant:
             if self.use_per_token_if_dynamic:
                 max_value = torch.max(hidden_states, dim=1).values.to(torch.float32)
