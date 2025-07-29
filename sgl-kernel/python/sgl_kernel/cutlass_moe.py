@@ -110,3 +110,72 @@ def cutlass_w4a8_moe_mm(
         chunk_size,
         topk,
     )
+
+
+def cutlass_w4a8_int8_moe_mm(
+    d: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    experts_offsets: torch.tensor,
+    problem_sizes: torch.tensor,
+    a_strides: torch.tensor,
+    b_strides: torch.tensor,
+    d_strides: torch.tensor,
+    s_strides: torch.tensor,
+    chunk_size: int = 128,
+    topk: int = 8,
+):
+    """
+    Perform grouped matrix multiplication between int4 weights and int8 activations.
+
+    This function executes multiple GEMM operations in parallel, which is useful for
+    scenarios like Mixture of Experts (MoE) where different inputs go through different
+    experts. The implementation leverages NVIDIA Hopper architecture features for
+    optimal performance with quantized weights.
+
+    Args:
+        d: Output matrices of shape [total_m, total_n]
+        a: Activation matrices in INT8 format
+           Each tensor should be of shape [total_m, K] in row-major layout
+        b: Weight matrices in packed int4 format
+           Each tensor should be of shape [E, N, K//2] in column-major layout
+           where each byte contains two 4-bit integers
+        a_scales: Scale factors for the inputs
+        b_scales: Scale factors for the quantized weights
+           Each tensor should be of shape [E, K//512, N*8]
+        experts_offsets: Tensor containing expert offsets for determining group boundaries
+        problem_sizes: with shape [num_experts, 3] (M, N, K for each group) (int32)
+        a_strides: Strides information for A matrices
+        b_strides: Strides information for B matrices
+        d_strides: Strides information for D matrices
+        s_strides: Strides information for b_scales matrices
+        chunk_size: Number of elements each scale value applies to (K//512), default to 128
+
+    Requirements:
+        - All tensors must be on a CUDA device
+        - Requires an NVIDIA Hopper GPU (H100)
+        - A tensors must be in int8 format
+        - B tensors must contain packed int4 values (stored as int8)
+
+    Note:
+        The function computes: D = (A * (B * scales))
+        for each group of tensors in parallel
+    """
+
+    torch.ops.sgl_kernel.cutlass_w4a8_int8_moe_mm.default(
+        d,
+        a,
+        b,
+        a_scales,
+        b_scales,
+        experts_offsets,
+        problem_sizes,
+        a_strides,
+        b_strides,
+        d_strides,
+        s_strides,
+        chunk_size,
+        topk,
+    )

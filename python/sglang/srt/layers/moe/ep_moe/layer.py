@@ -12,7 +12,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe, cutlass_w4aint8_moe 
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
@@ -572,7 +572,7 @@ class EPMoE(torch.nn.Module):
                     self.num_experts,
                 )
 
-            output = cutlass_w4a8_moe(
+            output = cutlass_w4aint8_moe(
                 self.start_expert_id,
                 self.end_expert_id,
                 self.num_experts,
