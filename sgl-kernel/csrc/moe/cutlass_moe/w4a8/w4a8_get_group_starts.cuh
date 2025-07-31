@@ -168,6 +168,7 @@ void run_int4_int8_get_group_gemm_starts(
   __CALL_W4A8_INT8_GET_STARTS_KERNEL(torch::kInt32, int32_t)
   __CALL_W4A8_INT8_GET_STARTS_KERNEL(torch::kBFloat16, cutlass::bfloat16_t)
   __CALL_W4A8_INT8_GET_STARTS_KERNEL(torch::kFloat16, half)
+  __CALL_W4A8_INT8_GET_STARTS_KERNEL(torch::kFloat32, float)
   else {
     TORCH_CHECK(false, "Invalid output type");
   }

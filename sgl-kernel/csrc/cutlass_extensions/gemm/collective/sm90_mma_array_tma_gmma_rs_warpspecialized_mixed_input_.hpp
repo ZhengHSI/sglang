@@ -993,7 +993,8 @@ struct CollectiveMmaArrayMixedInput<
     // We release buffers to producer warps(dma load) with some mmas in flight
     PipelineState smem_pipe_release = smem_pipe_read;
 
-    multiply_add<ElementAccumulator> fma;
+    // multiply_add<ElementAccumulator> fma;
+    multiply_add<float> fma;  // Use float for proper scale handling
 
     constexpr int NumMMAsPerChunk = GROUP_SIZE / cute::get<0, 1>(tCsB.shape())();
     constexpr int NumChunksPerTileK = cute::size<1>(sA.shape())() / GROUP_SIZE;
@@ -1068,22 +1069,41 @@ struct CollectiveMmaArrayMixedInput<
         // Apply the group-wise scaling
         // tCrS  ((4, _2, _2), MMA_M, _1)
         // accum ((2, _2, _2), MMA_M, _1)
-        auto tCrS = cute::get<1>(partitioned_extra_info);
-        for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-          for (int m = 0; m < size<0, 1>(accum); m++) {
-            for (int n = 0; n < size<0, 2>(accum); n++) {
-              for (int e = 0; e < size<0, 0>(accum); e++) {
-                auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+        if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
+          auto tCrS = cute::get<1>(partitioned_extra_info);
+          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+            for (int m = 0; m < size<0, 1>(accum); m++) {
+              for (int n = 0; n < size<0, 2>(accum); n++) {
+                for (int e = 0; e < size<0, 0>(accum); e++) {
+                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
 
-                if (chunk_id_ == 0) {
-                  accum(accum_coord) =
-                      intermediate_array[chunk_id_](accum_coord) * static_cast<float>(tCrS(scale_coord)[0]);
-                } else {
-                  accum(accum_coord) =
-                      fma(intermediate_array[chunk_id_](accum_coord),
-                          static_cast<float>(tCrS(scale_coord)[chunk_id_]),
-                          accum(accum_coord));
+                  if (chunk_id_ == 0) {
+                    accum(accum_coord) =
+                        intermediate_array[chunk_id_](accum_coord) * static_cast<float>(tCrS(scale_coord)[0]);
+                  } else {
+                    accum(accum_coord) =
+                        fma(intermediate_array[chunk_id_](accum_coord),
+                            static_cast<float>(tCrS(scale_coord)[chunk_id_]),
+                            accum(accum_coord));
+                  }
+                }
+              }
+            }
+          }
+        } else {
+          // DirectConvert mode: directly accumulate without scaling
+          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+            for (int m = 0; m < size<0, 1>(accum); m++) {
+              for (int n = 0; n < size<0, 2>(accum); n++) {
+                for (int e = 0; e < size<0, 0>(accum); e++) {
+                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+                  
+                  if (chunk_id_ == 0) {
+                    accum(accum_coord) = intermediate_array[chunk_id_](accum_coord);
+                  } else {
+                    accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), 1.0f, accum(accum_coord));
+                  }
                 }
               }
             }
@@ -1168,18 +1188,36 @@ struct CollectiveMmaArrayMixedInput<
               warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
               // Apply the group-wise scaling
-              auto tCrS = cute::get<1>(partitioned_extra_info);
-              for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-                for (int m = 0; m < size<0, 1>(accum); m++) {
-                  for (int n = 0; n < size<0, 2>(accum); n++) {
-                    for (int e = 0; e < size<0, 0>(accum); e++) {
-                      auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                      auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+              if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
+                auto tCrS = cute::get<1>(partitioned_extra_info);
+                for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+                  for (int m = 0; m < size<0, 1>(accum); m++) {
+                    for (int n = 0; n < size<0, 2>(accum); n++) {
+                      for (int e = 0; e < size<0, 0>(accum); e++) {
+                        auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+                        auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
 
-                      accum(accum_coord) =
-                          fma(intermediate_array[chunk_id_](accum_coord),
-                              static_cast<float>(tCrS(scale_coord)[chunk_id_]),
-                              accum(accum_coord));
+                        accum(accum_coord) =
+                            fma(intermediate_array[chunk_id_](accum_coord),
+                                static_cast<float>(tCrS(scale_coord)[chunk_id_]),
+                                accum(accum_coord));
+                      }
+                    }
+                  }
+                }
+              }else{
+                for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+                  for (int m = 0; m < size<0, 1>(accum); m++) {
+                    for (int n = 0; n < size<0, 2>(accum); n++) {
+                      for (int e = 0; e < size<0, 0>(accum); e++) {
+                        auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+                        auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+
+                        accum(accum_coord) =
+                            fma(intermediate_array[chunk_id_](accum_coord),
+                                1.0f,
+                                accum(accum_coord));
+                      }
                     }
                   }
                 }
@@ -1268,21 +1306,39 @@ struct CollectiveMmaArrayMixedInput<
           warpgroup_fence_operand(intermediate);
 
           // Apply the group-wise scaling
-          auto tCrS = cute::get<1>(partitioned_extra_info);
-          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-            for (int m = 0; m < size<0, 1>(accum); m++) {
-              for (int n = 0; n < size<0, 2>(accum); n++) {
-                for (int e = 0; e < size<0, 0>(accum); e++) {
-                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
-                  int scale_idx = k_block / NumMMAsPerChunk;
+          if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
+            auto tCrS = cute::get<1>(partitioned_extra_info);
+            for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+              for (int m = 0; m < size<0, 1>(accum); m++) {
+                for (int n = 0; n < size<0, 2>(accum); n++) {
+                  for (int e = 0; e < size<0, 0>(accum); e++) {
+                    auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+                    auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+                    int scale_idx = k_block / NumMMAsPerChunk;
 
-                  accum(accum_coord) = fma(
-                      intermediate(accum_coord), static_cast<float>(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
+                    accum(accum_coord) = fma(
+                        intermediate(accum_coord), static_cast<float>(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
+                  }
+                }
+              }
+            }
+          }else{
+            for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+              for (int m = 0; m < size<0, 1>(accum); m++) {
+                for (int n = 0; n < size<0, 2>(accum); n++) {
+                  for (int e = 0; e < size<0, 0>(accum); e++) {
+                    auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+                    auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+                    int scale_idx = k_block / NumMMAsPerChunk;
+
+                    accum(accum_coord) = fma(
+                        intermediate(accum_coord), 1.0f, accum(accum_coord));
+                  }
                 }
               }
             }
           }
+          
         }
       }
     }
