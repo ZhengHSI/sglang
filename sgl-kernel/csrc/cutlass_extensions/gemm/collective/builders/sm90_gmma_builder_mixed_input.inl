@@ -167,11 +167,16 @@ struct CollectiveBuilderMixedInput<
       Layout<Shape<_2, _1, _1>>,
       Layout<Shape<_1, _1, _1>>>;
 
+  using ConditionalElementAccumulator = cute::conditional_t<
+      std::is_same_v<RealElementBMma, int8_t>,
+      int32_t,
+      ElementAccumulator>;
+
   using TiledMma = decltype(cute::make_tiled_mma(
       cute::GMMA::rs_op_selector<
           RealElementAMma,
           RealElementBMma,
-          ElementAccumulator,
+          ConditionalElementAccumulator,
           TileShape_MNK,
           GMMA::Major::K,
           GMMA::Major::K>(),

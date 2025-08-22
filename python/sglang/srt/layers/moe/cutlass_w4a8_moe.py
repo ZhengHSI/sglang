@@ -9,6 +9,7 @@ from sgl_kernel import (
     get_cutlass_w4a8_moe_mm_data,
     sgl_per_tensor_quant_fp8,
     sgl_per_token_group_quant_int8,
+    sgl_per_token_group_quant_int8,
     silu_and_mul,
 )
 
@@ -322,15 +323,21 @@ def cutlass_w4aint8_moe(
         num_experts,
     )
 
-    gateup_input = torch.empty(
+    # gateup_input_f = torch.empty(
+    #     (m * topk, k),
+    #     device=device,
+    #     dtype=torch.int8,
+    # )
+
+    gateup_input_a = torch.empty(
         (m * topk, k),
         device=device,
-        dtype=torch.int8,
+        dtype=torch.float32,
     )
 
     pre_reorder_triton_kernel_for_cutlass_moe[(m,)](
         a,
-        gateup_input,
+        gateup_input_a,
         src2dst,
         local_topk_ids,
         a1_scale,
@@ -338,7 +345,23 @@ def cutlass_w4aint8_moe(
         topk,
         k,
         BLOCK_SIZE=512,
+        quant = False
     )
+
+    gateup_input = torch.empty(
+        (m * topk, k),
+        device=device,
+        dtype=torch.int8,
+    )
+
+    from sglang.srt.layers.quantization.int8_kernel import (
+        per_token_group_quant_int8,
+        per_token_quant_int8,
+        sglang_per_token_group_quant_int8,
+    )
+    
+    gateup_input, a1_scale = sglang_per_token_group_quant_int8(gateup_input_a, 128)
+    # gateup_input, a1_scale = per_tensor_quant_int8(gateup_input_a)
 
     # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
     # they are kept to allow for a quick switch of the permutation logic
@@ -377,22 +400,19 @@ def cutlass_w4aint8_moe(
     )
 
     intermediate = torch.empty((m * topk, n), device=device, dtype=torch.half)
-    silu_and_mul(c1.to(torch.half), intermediate)
+    silu_and_mul(c1, intermediate)
 
     intermediate_q = torch.empty(
-        intermediate.shape, dtype=torch.float8_e4m3fn, device=device
-    )
-    from sglang.srt.layers.quantization.int8_kernel import (
-    sglang_per_token_group_quant_int8,
+        intermediate.shape, dtype=torch.int8, device=device
     )
     intermediate_q, a2_scale = sglang_per_token_group_quant_int8(intermediate, 128)
-    # sgl_per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale.float(), True)
-    
+    # intermediate_q, a2_scale = per_tensor_quant_int8(intermediate)
+
     cutlass_w4a8_int8_moe_mm(
         c2,
-        intermediate_q.to(torch.int8),
+        intermediate_q,
         w2_q,
-        a2_scale.float(),
+        a2_scale,
         w2_scale,
         expert_offsets[:-1],
         problem_sizes2,

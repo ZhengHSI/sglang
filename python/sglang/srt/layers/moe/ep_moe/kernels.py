@@ -194,6 +194,7 @@ def pre_reorder_triton_kernel_for_cutlass_moe(
     topk,
     hidden_size,
     BLOCK_SIZE: tl.constexpr,
+    quant = True
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
@@ -206,7 +207,7 @@ def pre_reorder_triton_kernel_for_cutlass_moe(
         expert_id = tl.load(topk_ids_ptr + idx)
         if expert_id != num_experts:
             if a1_scales_ptr is not None:
-                scale = 1.0 / tl.load(a1_scales_ptr)
+                scale = tl.load(a1_scales_ptr)
             else:
                 scale = 1.0
 
@@ -216,8 +217,13 @@ def pre_reorder_triton_kernel_for_cutlass_moe(
                 offset = start_offset + tl.arange(0, BLOCK_SIZE)
                 mask = offset < hidden_size
                 in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
-                out_data = (in_data * scale).to(OutDtype)
-                tl.store(dst_ptr + offset, out_data, mask=mask)
+                if not quant:
+                    # out_data = tl.extra.cuda.libdevice.round(in_data / scale).to(OutDtype)
+                    out_data = in_data
+                    tl.store(dst_ptr + offset, out_data, mask=mask)
+                if quant:
+                    out_data = (in_data / scale).to(OutDtype)
+                    tl.store(dst_ptr + offset, out_data, mask=mask)
 
 
 @triton.jit

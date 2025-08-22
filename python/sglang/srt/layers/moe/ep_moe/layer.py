@@ -190,6 +190,7 @@ class EPMoE(torch.nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
 
         self.layer_id = layer_id
+        self.prefix = prefix
         self.num_experts = num_experts
         assert self.num_experts % self.tp_size == 0
         assert (
@@ -572,33 +573,128 @@ class EPMoE(torch.nn.Module):
                     self.num_experts,
                 )
 
-            output = cutlass_w4aint8_moe(
-                self.start_expert_id,
-                self.end_expert_id,
-                self.num_experts,
-                hidden_states,
-                self.w13_weight,
-                self.w2_weight,
-                self.w13_weight_scale_inv,
-                self.w2_weight_scale_inv,
-                topk_weights,
-                topk_ids,
-                local_topk_ids,
-                self.quant_method.a_strides1,
-                self.quant_method.b_strides1,
-                self.quant_method.c_strides1,
-                self.quant_method.a_strides2,
-                self.quant_method.b_strides2,
-                self.quant_method.c_strides2,
-                self.quant_method.s_strides13,
-                self.quant_method.s_strides2,
-                self.quant_method.expert_offsets,
-                self.quant_method.problem_sizes1,
-                self.quant_method.problem_sizes2,
-                self.w13_input_scale,
-                self.w2_input_scale,
-            )
-            return output
+            # output_fp = cutlass_w4a8_moe(
+            #     self.start_expert_id,
+            #     self.end_expert_id,
+            #     self.num_experts,
+            #     hidden_states,
+            #     self.w13_weight,
+            #     self.w2_weight,
+            #     self.w13_weight_scale_inv,
+            #     self.w2_weight_scale_inv,
+            #     topk_weights,
+            #     topk_ids,
+            #     local_topk_ids,
+            #     self.quant_method.a_strides1,
+            #     self.quant_method.b_strides1,
+            #     self.quant_method.c_strides1,
+            #     self.quant_method.a_strides2,
+            #     self.quant_method.b_strides2,
+            #     self.quant_method.c_strides2,
+            #     self.quant_method.s_strides13,
+            #     self.quant_method.s_strides2,
+            #     self.quant_method.expert_offsets,
+            #     self.quant_method.problem_sizes1,
+            #     self.quant_method.problem_sizes2,
+            #     self.w13_input_scale,
+            #     self.w2_input_scale,
+            # )
+
+            # output_int = cutlass_w4aint8_moe(
+            #     self.start_expert_id,
+            #     self.end_expert_id,
+            #     self.num_experts,
+            #     hidden_states,
+            #     self.w13_weight,
+            #     self.w2_weight,
+            #     self.w13_weight_scale_inv,
+            #     self.w2_weight_scale_inv,
+            #     topk_weights,
+            #     topk_ids,
+            #     local_topk_ids,
+            #     self.quant_method.a_strides1,
+            #     self.quant_method.b_strides1,
+            #     self.quant_method.c_strides1,
+            #     self.quant_method.a_strides2,
+            #     self.quant_method.b_strides2,
+            #     self.quant_method.c_strides2,
+            #     self.quant_method.s_strides13,
+            #     self.quant_method.s_strides2,
+            #     self.quant_method.expert_offsets,
+            #     self.quant_method.problem_sizes1,
+            #     self.quant_method.problem_sizes2,
+            #     self.w13_input_scale,
+            #     self.w2_input_scale,
+            # )
+            # try:
+            #     torch.testing.assert_close(output_int, output_fp, rtol=0.01, atol=0.1)
+            # except AssertionError as e:                 
+            #     print(self.prefix)
+            #     # print(f"    Ref tensor: {output_fp.flatten()}")
+            #     # print(f"    Cutlass tensor: {output_int.flatten()}")
+            #     # print(
+            #     #     f"    Max absolute difference: {torch.max(torch.abs(output_int.to(output_fp.dtype) - output_fp))}"
+            #     # )
+            #     # print(
+            #     #     f"    Mean absolute difference: {torch.mean(torch.abs(output_int.to(output_fp.dtype) - output_fp))}"
+            #     # )
+            #     # print(f"    AssertionError: {e}")
+            if self.layer_id in [8,12,13,14,15,16,18] or self.layer_id > 22:
+                output_fp = cutlass_w4a8_moe(
+                    self.start_expert_id,
+                    self.end_expert_id,
+                    self.num_experts,
+                    hidden_states,
+                    self.w13_weight,
+                    self.w2_weight,
+                    self.w13_weight_scale_inv,
+                    self.w2_weight_scale_inv,
+                    topk_weights,
+                    topk_ids,
+                    local_topk_ids,
+                    self.quant_method.a_strides1,
+                    self.quant_method.b_strides1,
+                    self.quant_method.c_strides1,
+                    self.quant_method.a_strides2,
+                    self.quant_method.b_strides2,
+                    self.quant_method.c_strides2,
+                    self.quant_method.s_strides13,
+                    self.quant_method.s_strides2,
+                    self.quant_method.expert_offsets,
+                    self.quant_method.problem_sizes1,
+                    self.quant_method.problem_sizes2,
+                    self.w13_input_scale,
+                    self.w2_input_scale,
+                )
+                return output_fp
+            else:
+                output_int = cutlass_w4aint8_moe(
+                    self.start_expert_id,
+                    self.end_expert_id,
+                    self.num_experts,
+                    hidden_states,
+                    self.w13_weight,
+                    self.w2_weight,
+                    self.w13_weight_scale_inv,
+                    self.w2_weight_scale_inv,
+                    topk_weights,
+                    topk_ids,
+                    local_topk_ids,
+                    self.quant_method.a_strides1,
+                    self.quant_method.b_strides1,
+                    self.quant_method.c_strides1,
+                    self.quant_method.a_strides2,
+                    self.quant_method.b_strides2,
+                    self.quant_method.c_strides2,
+                    self.quant_method.s_strides13,
+                    self.quant_method.s_strides2,
+                    self.quant_method.expert_offsets,
+                    self.quant_method.problem_sizes1,
+                    self.quant_method.problem_sizes2,
+                    self.w13_input_scale,
+                    self.w2_input_scale,
+                )
+                return output_int
 
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(

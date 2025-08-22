@@ -903,7 +903,7 @@ struct CollectiveMmaArrayMixedInput<
   CUTLASS_DEVICE void
   mma(MainloopPipeline pipeline,
       PipelineState smem_pipe_read,
-      FrgTensorC& accum,
+      FrgTensorC& float_accum,
       int k_tile_count,
       int thread_idx,
       TensorStorage& shared_tensors,
@@ -977,6 +977,14 @@ struct CollectiveMmaArrayMixedInput<
     auto copy_partitions_extra_info =
         Utils::retile_extra_mma_info(tiled_mma, partitioned_extra_info, warp_group_thread_idx);
 
+    // Create a new accumulator with the same layout as float_accum but using the tiled_mma's accumulator type
+    auto accum = make_fragment_like<typename TiledMma::ValTypeC>(float_accum);
+    // Initialize accum with values from float_accum, converting to the tiled_mma's accumulator type
+    // CUTLASS_PRAGMA_UNROLL
+    // for (int i = 0; i < cute::size(float_accum); ++i) {
+    //   accum[i] = static_cast<typename TiledMma::ValTypeC>(float_accum[i]);
+    // }
+
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));      // CPY_M
     CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCrA_copy_view));      // CPY_K
     CUTE_STATIC_ASSERT_V(size<1>(tCrA_mma) == size<1>(accum));           // MMA_M
@@ -993,8 +1001,7 @@ struct CollectiveMmaArrayMixedInput<
     // We release buffers to producer warps(dma load) with some mmas in flight
     PipelineState smem_pipe_release = smem_pipe_read;
 
-    // multiply_add<ElementAccumulator> fma;
-    multiply_add<float> fma;  // Use float for proper scale handling
+    multiply_add<float> fma;
 
     constexpr int NumMMAsPerChunk = GROUP_SIZE / cute::get<0, 1>(tCsB.shape())();
     constexpr int NumChunksPerTileK = cute::size<1>(sA.shape())() / GROUP_SIZE;
@@ -1079,13 +1086,19 @@ struct CollectiveMmaArrayMixedInput<
                   auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
 
                   if (chunk_id_ == 0) {
-                    accum(accum_coord) =
-                        intermediate_array[chunk_id_](accum_coord) * static_cast<float>(tCrS(scale_coord)[0]);
+                    float_accum(accum_coord) =
+                        static_cast<float>(intermediate_array[chunk_id_](accum_coord)) * static_cast<float>(tCrS(scale_coord)[0]);
+                    // accum(accum_coord) =
+                    //     static_cast<float>(intermediate_array[chunk_id_](accum_coord)) * static_cast<float>(tCrS(scale_coord)[0]);
                   } else {
-                    accum(accum_coord) =
-                        fma(intermediate_array[chunk_id_](accum_coord),
+                    float_accum(accum_coord) =
+                        fma(static_cast<float>(intermediate_array[chunk_id_](accum_coord)),
                             static_cast<float>(tCrS(scale_coord)[chunk_id_]),
-                            accum(accum_coord));
+                            float_accum(accum_coord));
+                    // accum(accum_coord) =
+                    //     fma(static_cast<float>(intermediate_array[chunk_id_](accum_coord)),
+                    //         static_cast<float>(tCrS(scale_coord)[chunk_id_]),
+                    //         accum(accum_coord));
                   }
                 }
               }
@@ -1197,10 +1210,14 @@ struct CollectiveMmaArrayMixedInput<
                         auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
                         auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
 
-                        accum(accum_coord) =
-                            fma(intermediate_array[chunk_id_](accum_coord),
+                        float_accum(accum_coord) =
+                            fma(static_cast<float>(intermediate_array[chunk_id_](accum_coord)),
                                 static_cast<float>(tCrS(scale_coord)[chunk_id_]),
-                                accum(accum_coord));
+                                float_accum(accum_coord));
+                        // accum(accum_coord) =
+                        //     fma(static_cast<float>(intermediate_array[chunk_id_](accum_coord)),
+                        //         static_cast<float>(tCrS(scale_coord)[chunk_id_]),
+                        //         accum(accum_coord));
                       }
                     }
                   }
@@ -1316,8 +1333,10 @@ struct CollectiveMmaArrayMixedInput<
                     auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
                     int scale_idx = k_block / NumMMAsPerChunk;
 
-                    accum(accum_coord) = fma(
-                        intermediate(accum_coord), static_cast<float>(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
+                    float_accum(accum_coord) = fma(
+                        static_cast<float>(intermediate(accum_coord)), static_cast<float>(tCrS(scale_coord)[scale_idx]), float_accum(accum_coord));
+                    // accum(accum_coord) = fma(
+                    //     static_cast<float>(intermediate(accum_coord)), static_cast<float>(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
                   }
                 }
               }

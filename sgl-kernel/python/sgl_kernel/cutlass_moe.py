@@ -144,6 +144,10 @@ def cutlass_w4a8_int8_moe_mm(
            where each byte contains two 4-bit integers
         a_scales: Scale factors for the inputs
         b_scales: Scale factors for the quantized weights
+        b_scales: Scale factors for the quantized weights
+           - For per tensor quantization: shape [1]
+           - For per token quantization: shape [total_m]
+        b_scales: Scale factors for the quantized weights
            Each tensor should be of shape [E, K//512, N*8]
         experts_offsets: Tensor containing expert offsets for determining group boundaries
         problem_sizes: with shape [num_experts, 3] (M, N, K for each group) (int32)
@@ -158,6 +162,9 @@ def cutlass_w4a8_int8_moe_mm(
         - Requires an NVIDIA Hopper GPU (H100)
         - A tensors must be in int8 format
         - B tensors must contain packed int4 values (stored as int8)
+
+    Note:
+        - a_scales supports both per tensor and per token quantization
 
     Note:
         The function computes: D = (A * (B * scales))

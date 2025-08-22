@@ -423,3 +423,123 @@ def w8a8_block_int8_matmul(
     )
 
     return C
+
+@triton.jit
+def _per_tensor_absmax_kernel(
+    x_ptr,
+    absmax_ptr,
+    numel,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """计算整个 tensor 的 absmax"""
+    pid = tl.program_id(0)
+    
+    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offset < numel
+    
+    x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+    local_absmax = tl.max(tl.abs(x))
+    
+    # 使用 atomic max 来找到全局最大值
+    tl.atomic_max(absmax_ptr, local_absmax)
+
+
+@triton.jit
+def _per_tensor_quant_int8(
+    x_ptr,
+    xq_ptr,
+    scale_ptr,
+    x_sum_ptr,
+    numel,
+    CAL_SUM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """使用统一的 scale 对整个 tensor 进行量化"""
+    pid = tl.program_id(0)
+    
+    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offset < numel
+    
+    # 加载全局 scale
+    scale = tl.load(scale_ptr)
+    
+    # 加载数据并量化
+    x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+    x_q = x / scale
+    x_q = tl.extra.cuda.libdevice.round(x_q).to(tl.int8)
+    
+    # 存储量化结果
+    tl.store(xq_ptr + offset, x_q, mask=mask)
+    
+    if CAL_SUM:
+        # 计算当前块的 sum
+        local_sum = tl.sum(x)
+        # 使用 atomic add 累加到全局 sum
+        tl.atomic_add(x_sum_ptr, local_sum)
+
+
+def per_tensor_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
+    """
+    Per-tensor INT8 量化
+    
+    Args:
+        x: 输入张量
+        scale_dtype: scale 的数据类型
+        cal_sum: 是否计算总和
+    
+    Returns:
+        tuple: (量化后的张量, scale, [可选]sum)
+    """
+    # 展平张量以便处理
+    original_shape = x.shape
+    x_flat = x.view(-1)
+    numel = x_flat.numel()
+    
+    # 分配输出张量
+    x_q = torch.empty_like(x_flat, dtype=torch.int8)
+    
+    # 初始化 absmax 为 0，使用 new_zeros 避免在 CUDA graph capture 时出现问题
+    absmax = x_flat.new_zeros(1, dtype=torch.float32)
+    
+    # 计算 block size
+    BLOCK_SIZE = 1024  # 可以根据需要调整
+    grid_size = triton.cdiv(numel, BLOCK_SIZE)
+    
+    # 第一步：计算全局 absmax
+    _per_tensor_absmax_kernel[(grid_size,)](
+        x_flat,
+        absmax,
+        numel,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    # 计算 scale，确保不为 0
+    # 避免在 CUDA graph capture 期间创建新的 tensor
+    eps = 1e-10
+    absmax_val = torch.clamp_min(absmax, eps)
+    scale = (absmax_val / 127).to(scale_dtype)
+    
+    # 初始化 sum（如果需要）
+    if cal_sum:
+        x_sum = torch.zeros_like(absmax, dtype=x.dtype)
+    else:
+        x_sum = None
+    
+    # 第二步：使用计算得到的 scale 进行量化
+    _per_tensor_quant_int8[(grid_size,)](
+        x_flat,
+        x_q,
+        scale,
+        x_sum,
+        numel,
+        CAL_SUM=cal_sum,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    # 恢复原始形状
+    x_q = x_q.view(original_shape)
+    
+    if cal_sum:
+        return x_q, scale, x_sum
+    else:
+        return x_q, scale
