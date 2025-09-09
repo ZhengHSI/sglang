@@ -308,21 +308,38 @@ class W4MoEMethod(QuantizeMethodBase):
 
         return
 
+    # def _interleave_scales(self, scales: torch.Tensor) -> torch.Tensor:
+    #     """Interleave scales in groups of 4 similar to TRT-LLM implementation."""
+    #     s_shape = scales.shape
+    #     # print(s_shape)
+    #     # Reshape to separate groups of 4
+    #     scales_interleaved = scales.reshape(
+    #         s_shape[0], s_shape[1], (s_shape[2] // 4), 4
+    #     )
+    #     # Permute dimensions to interleave
+    #     scales_interleaved = scales_interleaved.permute(0, 2, 1, 3)
+    #     # Reshape back to original dimensions but with interleaved values
+    #     scales_interleaved = scales_interleaved.reshape(
+    #         s_shape[0], s_shape[2] // 4, s_shape[1] * 4
+    #     )
+    #     return scales_interleaved.contiguous()
+
     def _interleave_scales(self, scales: torch.Tensor) -> torch.Tensor:
-        """Interleave scales in groups of 4 similar to TRT-LLM implementation."""
-        s_shape = scales.shape
-        # print(s_shape)
-        # Reshape to separate groups of 4
-        scales_interleaved = scales.reshape(
-            s_shape[0], s_shape[1], (s_shape[2] // 4), 4
-        )
-        # Permute dimensions to interleave
-        scales_interleaved = scales_interleaved.permute(0, 2, 1, 3)
-        # Reshape back to original dimensions but with interleaved values
-        scales_interleaved = scales_interleaved.reshape(
-            s_shape[0], s_shape[2] // 4, s_shape[1] * 4
-        )
-        return scales_interleaved.contiguous()
+        """Interleave scales in groups of 4 similar to pack_interleave implementation."""
+        # 参考注释掉的 pack_interleave 函数中的缩放处理方式
+        # 输入 scales 形状: [E, N, K//128] 
+        # 输出形状: [E, K//128//4, N*4]
+        
+        num_experts, N, K_groups = scales.shape
+        # 确保 K_groups 能被4整除
+        
+        w_scale = torch.zeros(num_experts, K_groups, N * 4, dtype=scales.dtype, device=scales.device)
+
+        for i in range(num_experts):
+            scale_expanded = scales[i].t().unsqueeze(-1).expand(-1, -1, 4).reshape(K_groups, N * 4)
+            w_scale[i] = scale_expanded
+            
+        return w_scale.contiguous()
 
     def process_weights_after_loading(self, layer: Module) -> None:
         dtype = torch.bfloat16
