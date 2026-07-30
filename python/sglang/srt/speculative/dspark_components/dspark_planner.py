@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 import msgspec
 import torch
@@ -67,7 +67,7 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         server_args: ServerArgs,
         verify_num_draft_tokens: int,
-        pp_enabled: bool = False,
+        authoritative_scheduler: bool = True,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -75,10 +75,12 @@ class DSparkVerifyPlanner:
         self.device = device
         self.server_args = server_args
         self.verify_num_draft_tokens = verify_num_draft_tokens
+        self._authoritative_scheduler = authoritative_scheduler
         self._align_verify_tokens_to_graph_tier = (
             server_args.speculative_dspark_align_verify_tokens_to_graph_tier
         )
 
+        self._ragged_verify_mode = read_ragged_verify_mode()
         self._confidence_head = getattr(self.draft_model, "confidence_head", None)
 
         sts_path = server_args.speculative_dspark_confidence_sts_path
@@ -111,7 +113,9 @@ class DSparkVerifyPlanner:
                     sts_path,
                     self.gamma,
                 )
-        elif sts_path and self._confidence_head is None:
+        elif (
+            sts_path and self._confidence_head is None and self._authoritative_scheduler
+        ):
             if tp_rank == 0:
                 logger.warning(
                     "DSpark STS calibration path given but no confidence head present "
@@ -119,28 +123,17 @@ class DSparkVerifyPlanner:
                     sts_path,
                 )
 
-        self._ragged_verify_mode = read_ragged_verify_mode()
-        # PP requires every verify rank to produce an identical layout. The
-        # confidence-driven ragged scheduler runs only on the last rank (which
-        # holds the draft model), so under PP every rank degrades to STATIC
-        # (uniform verify-all) to keep layouts byte-identical across ranks.
-        if pp_enabled and self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
-            if tp_rank == 0:
-                logger.warning(
-                    "DSpark PP forces SGLANG_RAGGED_VERIFY_MODE=static (got %r): "
-                    "cross-rank layout identity is only guaranteed under uniform "
-                    "verify-all. Ragged scheduling under PP is a future enhancement.",
-                    self._ragged_verify_mode.value,
-                )
-            self._ragged_verify_mode = RaggedVerifyMode.STATIC
         self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
+        self._sync_verify_budget = False
+        self._budget_sync_tensor: Optional[torch.Tensor] = None
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
-            if self._confidence_head is None:
+            self._require_prep_in_cuda_graph()
+            if self._authoritative_scheduler and self._confidence_head is None:
                 raise ValueError(
                     f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
                     f"schedules per-request verify lengths from the draft confidence "
@@ -150,7 +143,16 @@ class DSparkVerifyPlanner:
                     f"draft checkpoint that includes the confidence head, or run "
                     f"SGLANG_RAGGED_VERIFY_MODE=static."
                 )
-            self._require_prep_in_cuda_graph()
+            self._dynamic_graph_tier = not is_dp_attention_enabled()
+            if not self._authoritative_scheduler:
+                if tp_rank == 0:
+                    logger.info(
+                        "DSpark PP executor initialized for relayed ragged-verify "
+                        "plans (mode=%s); this stage does not own the confidence "
+                        "head or schedule verify budgets.",
+                        self._ragged_verify_mode.value,
+                    )
+                return
             sps_table = build_sps_cost_table(
                 server_args=self.server_args,
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
@@ -159,6 +161,14 @@ class DSparkVerifyPlanner:
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_uninitialized_sps_table(sps_table)
             )
+            tp_group = get_tp_group()
+            self._sync_verify_budget = (
+                envs.SGLANG_DSPARK_SYNC_VERIFY_BUDGET.get()
+                and tp_group.world_size > 1
+                and not self._is_verify_all
+            )
+            if self._sync_verify_budget:
+                self._budget_sync_tensor = torch.empty(1, dtype=torch.int64)
             relay_lag_steps = (
                 0
                 if self.server_args.disable_overlap_schedule
@@ -170,7 +180,6 @@ class DSparkVerifyPlanner:
                 model_runner=self.model_runner,
                 relay_lag_steps=relay_lag_steps,
             )
-            self._dynamic_graph_tier = not is_dp_attention_enabled()
             self._dp_tier_gather_enabled = (
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_dp_attention_enabled()
@@ -241,12 +250,83 @@ class DSparkVerifyPlanner:
         return self._ragged_verify_mode is RaggedVerifyMode.COMPACT
 
     @property
+    def is_static_mode(self) -> bool:
+        return self._ragged_verify_mode is RaggedVerifyMode.STATIC
+
+    @property
     def is_verify_all(self) -> bool:
         return self._is_verify_all
 
     @property
     def mode_value(self) -> str:
         return self._ragged_verify_mode.value
+
+    def verify_budget_from_lens(self, verify_lens: Sequence[int]) -> int:
+        effective_floor = max(self._schedule_cfg.min_verify_len, 1)
+        values = (
+            verify_lens.to("cpu", dtype=torch.int64).tolist()
+            if isinstance(verify_lens, torch.Tensor)
+            else verify_lens
+        )
+        return sum(max(int(length) - effective_floor, 0) for length in values)
+
+    def verify_lens_for_pp_relay(
+        self,
+        *,
+        layout: Optional[RaggedVerifyLayout],
+        bs: int,
+    ) -> list[int]:
+        if layout is None:
+            verify_lens = [self.verify_num_draft_tokens] * bs
+        elif layout.verify_lens_cpu is not None:
+            verify_lens = list(layout.verify_lens_cpu)
+        else:
+            verify_lens = layout.verify_lens.to("cpu").tolist()
+        verify_lens = self._validate_relayed_verify_lens(verify_lens, expected_bs=bs)
+        return self._sync_pp_verify_lens_across_tp(verify_lens)
+
+    def _validate_relayed_verify_lens(
+        self,
+        verify_lens: Sequence[int],
+        *,
+        expected_bs: int,
+    ) -> list[int]:
+        if isinstance(verify_lens, torch.Tensor):
+            values = verify_lens.to("cpu", dtype=torch.int64).tolist()
+        else:
+            values = [int(length) for length in verify_lens]
+        if len(values) != expected_bs:
+            raise ValueError(
+                "DSpark PP relayed verify plan has the wrong batch size: "
+                f"expected {expected_bs}, got {len(values)}."
+            )
+        effective_floor = max(self._schedule_cfg.min_verify_len, 1)
+        if any(
+            length < effective_floor or length > self.verify_num_draft_tokens
+            for length in values
+        ):
+            raise ValueError(
+                "DSpark PP relayed verify lengths must be in "
+                f"[{effective_floor}, {self.verify_num_draft_tokens}], got "
+                f"{values}."
+            )
+        return values
+
+    def _sync_pp_verify_lens_across_tp(self, verify_lens: Sequence[int]) -> list[int]:
+        if self.server_args.pp_size <= 1:
+            return [int(length) for length in verify_lens]
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
+            return [int(length) for length in verify_lens]
+        sync_tensor = torch.tensor(verify_lens, dtype=torch.int32)
+        if tp_group.rank_in_group != 0:
+            sync_tensor.zero_()
+        torch.distributed.broadcast(
+            sync_tensor,
+            src=tp_group.ranks[0],
+            group=tp_group.cpu_group,
+        )
+        return sync_tensor.tolist()
 
     @property
     def lag_steps(self) -> Optional[int]:
@@ -409,17 +489,79 @@ class DSparkVerifyPlanner:
     ) -> Optional[int]:
         if resolved is None:
             self._budget_planner.note_non_decode_step()
-            return None
-        current_generation = self.model_runner.req_to_token_pool.req_generation[
-            req_pool_indices_cpu.to(torch.int64)
-        ]
-        return int(
-            self._budget_planner.compute_budget(
-                confidence=resolved.confidence,
-                generation=resolved.generation,
-                current_generation=current_generation,
-                req_pool_indices_cpu=req_pool_indices_cpu,
+            local_budget = None
+        else:
+            current_generation = self.model_runner.req_to_token_pool.req_generation[
+                req_pool_indices_cpu.to(torch.int64)
+            ]
+            local_budget = int(
+                self._budget_planner.compute_budget(
+                    confidence=resolved.confidence,
+                    generation=resolved.generation,
+                    current_generation=current_generation,
+                    req_pool_indices_cpu=req_pool_indices_cpu,
+                )
             )
+        return self._sync_budget_across_tp(local_budget)
+
+    def _sync_budget_across_tp(self, budget: Optional[int]) -> Optional[int]:
+        if not self._sync_verify_budget:
+            return budget
+        assert self._budget_sync_tensor is not None
+        tp_group = get_tp_group()
+        local_value = -1 if budget is None else int(budget)
+        self._budget_sync_tensor[0] = local_value if tp_group.rank_in_group == 0 else 0
+        torch.distributed.broadcast(
+            self._budget_sync_tensor,
+            src=tp_group.ranks[0],
+            group=tp_group.cpu_group,
+        )
+        synced_value = int(self._budget_sync_tensor.item())
+        return None if synced_value < 0 else synced_value
+
+    def layout_from_relayed_verify_lens(
+        self,
+        *,
+        verify_lens: Sequence[int],
+        expected_bs: int,
+        device: torch.device,
+    ) -> Optional[RaggedVerifyLayout]:
+        if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
+            return None
+        verify_lens_cpu = self._validate_relayed_verify_lens(
+            verify_lens, expected_bs=expected_bs
+        )
+        total_verify_tokens = sum(verify_lens_cpu)
+        if ragged_layout_exceeds_captured_grid(
+            num_reqs=expected_bs,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            model_runner=self.model_runner,
+            tier_tokens_hint=total_verify_tokens,
+        ):
+            logger.warning(
+                "DSpark PP relayed compact plan exceeds the captured graph grid "
+                "(bs=%d, verify_tokens=%d); falling back to full verify.",
+                expected_bs,
+                total_verify_tokens,
+            )
+            return None
+        grid = verify_layout_grid(
+            verify_lens_cpu=verify_lens_cpu,
+            ragged_verify_mode=self._ragged_verify_mode,
+            model_runner=self.model_runner,
+        )
+        graph_num_tokens_floor = verify_layout_graph_num_tokens_floor(
+            num_reqs=expected_bs,
+            ragged_verify_mode=self._ragged_verify_mode,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            model_runner=self.model_runner,
+            tier_num_tokens=total_verify_tokens,
+        )
+        return RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=verify_lens_cpu,
+            device=device,
+            grid=grid,
+            graph_num_tokens_floor=graph_num_tokens_floor,
         )
 
     def schedule_layout(

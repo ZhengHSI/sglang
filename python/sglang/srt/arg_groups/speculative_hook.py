@@ -300,11 +300,34 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {server_args.speculative_moe_a2a_backend!r})."
             )
 
-    if server_args.pp_size > 1 and server_args.enable_dp_attention:
-        raise ValueError(
-            "DSpark PP currently does not support dp-attention "
-            "(PP ranks must see an identical batch). Set --dp-size 1."
+    if server_args.pp_size > 1:
+        if server_args.enable_dp_attention:
+            raise ValueError(
+                "DSpark PP currently does not support dp-attention "
+                "(PP ranks must see an identical batch). Set --dp-size 1."
+            )
+
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
         )
+
+        ragged_verify_mode = read_ragged_verify_mode()
+        if (
+            ragged_verify_mode is not RaggedVerifyMode.STATIC
+            and server_args.pp_size != 2
+        ):
+            raise ValueError(
+                "DSpark dynamic ragged verify with pipeline parallelism "
+                "currently supports PP2 only; got "
+                f"pp_size={server_args.pp_size}, "
+                f"mode={ragged_verify_mode.value!r}."
+            )
+        if not server_args.disable_overlap_schedule:
+            server_args.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduling is disabled for DSpark pipeline parallelism."
+            )
 
     if server_args.speculative_draft_model_path is None:
         if _target_checkpoint_bundles_dspark_draft(server_args):

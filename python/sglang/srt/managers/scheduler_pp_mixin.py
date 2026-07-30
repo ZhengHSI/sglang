@@ -1153,7 +1153,12 @@ class SchedulerPPMixin:
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
         batch.input_ids = next_token_ids
 
-        if not self.spec_algorithm.is_none() and "pp_spec_output" in pp_outputs.tensors:
+        has_spec_raw = (
+            DSparkPPVerifyInputRaw.is_in_tensor_dict(pp_outputs.tensors)
+            if self.spec_algorithm.is_dspark()
+            else "pp_spec_output" in pp_outputs.tensors
+        )
+        if not self.spec_algorithm.is_none() and has_spec_raw:
             # Spec-v2 decode path: extract next iter's draft info from pp_outputs.
             batch.spec_info = _pp_raw_cls().from_pp_outputs(pp_outputs)
         elif not self.spec_algorithm.is_none() and batch.forward_mode.is_extend():
@@ -1188,8 +1193,10 @@ class SchedulerPPMixin:
         )
 
         if isinstance(batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)):
-            output_result.accept_lens = torch.tensor(
-                batch.spec_info.accept_lens, dtype=torch.int64
+            output_result.accept_lens = torch.as_tensor(
+                batch.spec_info.accept_lens,
+                dtype=torch.int64,
+                device=batch.seq_lens.device,
             )
             output_result.speculative_num_draft_tokens = (
                 self.server_args.speculative_num_draft_tokens

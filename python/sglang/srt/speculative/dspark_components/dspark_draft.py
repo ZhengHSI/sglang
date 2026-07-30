@@ -28,6 +28,7 @@ from sglang.srt.speculative.spec_info import (
 from sglang.srt.speculative.spec_utils import draft_tp_context
 
 logger = logging.getLogger(__name__)
+_DRAFT_TOPK_LOGGED = False
 
 
 class DraftBlockResult(msgspec.Struct, frozen=True):
@@ -164,11 +165,33 @@ def sample_draft_block(
     sampling_info,
     markov_head,
     device: torch.device,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
 ) -> DraftBlockResult:
+    global _DRAFT_TOPK_LOGGED
+
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
     any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
     fast_sampling = envs.SGLANG_DSPARK_FAST_SAMPLING.get()
+    draft_top_k = None
+    if (
+        any_sampling
+        and envs.SGLANG_DSPARK_DRAFT_TOPK_SAMPLING.get()
+        and sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+        and not getattr(sampling_info, "need_min_p_sampling", False)
+        and uniform_top_k_value is not None
+        and int(uniform_top_k_value) == int(max_top_k or -1)
+        and 1 < int(uniform_top_k_value) < int(base_logits.shape[-1])
+    ):
+        draft_top_k = int(uniform_top_k_value)
+        if not _DRAFT_TOPK_LOGGED:
+            logger.info(
+                "DSpark draft proposal top-k sampling is active: top_k=%d",
+                draft_top_k,
+            )
+            _DRAFT_TOPK_LOGGED = True
 
     if sampling_info is None:
         temperatures = torch.ones(bs, dtype=torch.float32, device=device)
@@ -186,16 +209,35 @@ def sample_draft_block(
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             if fast_sampling:
+                noise_width = (
+                    draft_top_k
+                    if draft_top_k is not None
+                    else int(step_logits.shape[-1])
+                )
                 exp_noise = torch.empty(
-                    step_logits.shape, dtype=torch.float32, device=step_logits.device
+                    (step_logits.shape[0], noise_width),
+                    dtype=torch.float32,
+                    device=step_logits.device,
                 ).exponential_(1)
                 return SampleStepTokens.execute(
                     step_logits=step_logits,
                     temperatures=temperatures,
                     greedy_mask=greedy_mask,
                     exp_noise=exp_noise,
+                    top_k=draft_top_k,
                 )
             else:
+                if draft_top_k is not None:
+                    topk_logits, topk_ids = torch.topk(
+                        step_logits, k=draft_top_k, dim=-1
+                    )
+                    probs = torch.softmax(
+                        topk_logits.float() / temperatures[:, None], dim=-1
+                    )
+                    sampled_pos = torch.multinomial(probs, num_samples=1)
+                    sampled_tokens = topk_ids.gather(-1, sampled_pos).squeeze(-1)
+                    argmax_tokens = torch.argmax(step_logits, dim=-1)
+                    return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
                 probs = torch.softmax(
                     step_logits.float() / temperatures[:, None], dim=-1
                 )
@@ -304,6 +346,8 @@ class DraftBlockProposer:
                 sampling_info=sampling_info,
                 markov_head=self.draft_model.markov_head,
                 device=device,
+                max_top_k=getattr(draft_input, "max_top_k", None),
+                uniform_top_k_value=getattr(draft_input, "uniform_top_k_value", None),
             )
         return DraftProposal(
             draft_block_ids=draft_block_ids,

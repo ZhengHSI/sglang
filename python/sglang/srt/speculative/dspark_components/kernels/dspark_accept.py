@@ -174,6 +174,244 @@ def accept_sampling(
     return correct_len, bonus, cap_trim_lens
 
 
+def build_uniform_topk_probs(
+    *,
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    """Build dense probabilities for the exact fallback sampler."""
+    vocab_size = int(logits.shape[-1])
+    top_k = max(1, min(int(top_k), vocab_size))
+    temperatures = (
+        temperatures.reshape(logits.shape[0])
+        .to(device=logits.device, dtype=torch.float32)
+        .clamp_min_(1e-5)
+    )
+    topk_logits, topk_ids = torch.topk(logits, k=top_k, dim=-1)
+    topk_probs = torch.softmax(
+        topk_logits.to(torch.float32) / temperatures[:, None, None],
+        dim=-1,
+    )
+    probs = torch.zeros_like(logits, dtype=torch.float32)
+    probs.scatter_(-1, topk_ids, topk_probs)
+    return probs
+
+
+def accept_sampling_logits_fast(
+    *,
+    candidates: torch.Tensor,
+    target_logits: torch.Tensor,
+    draft_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: Optional[torch.Tensor] = None,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
+    draft_top_k: Optional[int] = None,
+    verify_num_draft_tokens: int,
+    cutoff_verify_lens: Optional[torch.Tensor] = None,
+    uniform_samples: Optional[torch.Tensor] = None,
+    uniform_samples_final: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exact chain rejection without materializing dense vocabulary probabilities."""
+    bs, num_slots = candidates.shape
+    gamma = num_slots - 1
+    if num_slots != verify_num_draft_tokens:
+        raise ValueError(
+            "DSpark fast rejection candidate width mismatch: "
+            f"expected={verify_num_draft_tokens}, got={num_slots}."
+        )
+    if target_logits.shape[0] != bs * num_slots:
+        raise ValueError(
+            "DSpark fast rejection target-logit row mismatch: "
+            f"expected={bs * num_slots}, got={target_logits.shape[0]}."
+        )
+    if draft_logits.shape[:2] != (bs, gamma):
+        raise ValueError(
+            "DSpark fast rejection draft-logit shape mismatch: "
+            f"expected={(bs, gamma)}, got={tuple(draft_logits.shape[:2])}."
+        )
+
+    device = candidates.device
+    vocab_size = int(target_logits.shape[-1])
+    if int(draft_logits.shape[-1]) != vocab_size:
+        raise ValueError(
+            "DSpark fast rejection vocabulary mismatch: "
+            f"target={vocab_size}, draft={draft_logits.shape[-1]}."
+        )
+    temperatures = (
+        temperatures.reshape(bs).to(device=device, dtype=torch.float32).clamp_min_(1e-5)
+    )
+    target_3d = target_logits.view(bs, num_slots, vocab_size)
+    draft_3d = draft_logits.view(bs, gamma, vocab_size)
+
+    request_top_ks = None
+    if top_ks is not None:
+        request_top_ks = (
+            top_ks.reshape(bs)
+            .to(device=device, dtype=torch.int64)
+            .clamp(min=1, max=vocab_size)
+        )
+        if max_top_k is None or int(max_top_k) <= 1:
+            max_top_k = int(request_top_ks.max().item())
+        max_top_k = max(1, min(int(max_top_k), vocab_size))
+
+    draft_tokens = candidates[:, 1:].to(torch.long)
+    draft_support_ids = None
+    draft_support_probs = None
+    scaled_draft = None
+    draft_lse = None
+    if (
+        draft_top_k is not None
+        and request_top_ks is not None
+        and 1 < int(draft_top_k) < vocab_size
+    ):
+        draft_top_k = int(draft_top_k)
+        draft_support_logits, draft_support_ids = torch.topk(
+            draft_3d, k=draft_top_k, dim=-1
+        )
+        draft_support_probs = torch.softmax(
+            draft_support_logits.to(torch.float32) / temperatures[:, None, None],
+            dim=-1,
+        )
+        candidate_matches = draft_support_ids == draft_tokens.unsqueeze(-1)
+        draft_candidate_probs = draft_support_probs.masked_fill(
+            ~candidate_matches, 0
+        ).sum(dim=-1)
+    else:
+        scaled_draft = draft_3d.to(dtype=torch.float32, copy=True)
+        scaled_draft.div_(temperatures[:, None, None])
+        draft_lse = torch.logsumexp(scaled_draft, dim=-1)
+        draft_candidate_logits = scaled_draft.gather(
+            -1, draft_tokens.unsqueeze(-1)
+        ).squeeze(-1)
+        draft_candidate_probs = torch.exp(draft_candidate_logits - draft_lse)
+
+    support_token_ids = None
+    if top_ks is None:
+        scaled_target = target_3d.to(dtype=torch.float32, copy=True)
+        scaled_target.div_(temperatures[:, None, None])
+        target_lse = torch.logsumexp(scaled_target, dim=-1)
+        target_candidate_logits = (
+            scaled_target[:, :gamma].gather(-1, draft_tokens.unsqueeze(-1)).squeeze(-1)
+        )
+        target_candidate_probs = torch.exp(
+            target_candidate_logits - target_lse[:, :gamma]
+        )
+    else:
+        target_support_logits, target_support_ids = torch.topk(
+            target_3d, k=max_top_k, dim=-1
+        )
+        target_support_logits = (
+            target_support_logits.to(torch.float32) / temperatures[:, None, None]
+        )
+        if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
+            valid_ranks = (
+                torch.arange(max_top_k, device=device, dtype=torch.int64)[None, None, :]
+                < request_top_ks[:, None, None]
+            )
+            target_support_logits = target_support_logits.masked_fill(
+                ~valid_ranks, float("-inf")
+            )
+        target_support_probs = torch.softmax(target_support_logits, dim=-1)
+
+        # Match the reference sampler's token-id traversal order.
+        support_token_ids, support_order = torch.sort(target_support_ids, dim=-1)
+        target_support_probs = target_support_probs.gather(-1, support_order)
+        candidate_matches = support_token_ids[:, :gamma] == draft_tokens.unsqueeze(-1)
+        target_candidate_probs = (
+            target_support_probs[:, :gamma]
+            .masked_fill(~candidate_matches, 0)
+            .sum(dim=-1)
+        )
+
+    if uniform_samples is None:
+        uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
+    else:
+        uniform_samples = uniform_samples.to(device=device, dtype=torch.float32)
+    accepted = uniform_samples * draft_candidate_probs < target_candidate_probs
+    accepted_prefix = torch.cumprod(accepted.to(torch.int32), dim=1)
+    uncapped_correct_len = accepted_prefix.sum(dim=1).to(torch.int32)
+
+    rows = torch.arange(bs, dtype=torch.long, device=device)
+    selected_rows = uncapped_correct_len.to(torch.long)
+    safe_draft_rows = selected_rows.clamp(max=max(gamma - 1, 0))
+    if support_token_ids is None:
+        selected_token_ids = None
+        target_probs = torch.softmax(scaled_target[rows, selected_rows], dim=-1)
+        draft_probs = torch.softmax(scaled_draft[rows, safe_draft_rows], dim=-1)
+    else:
+        selected_token_ids = support_token_ids[rows, selected_rows]
+        target_probs = target_support_probs[rows, selected_rows]
+        if draft_support_ids is not None:
+            selected_draft_ids = draft_support_ids[rows, safe_draft_rows]
+            selected_draft_probs = draft_support_probs[rows, safe_draft_rows]
+            support_matches = selected_token_ids.unsqueeze(
+                -1
+            ) == selected_draft_ids.unsqueeze(-2)
+            draft_probs = (
+                selected_draft_probs[:, None, :]
+                .masked_fill(~support_matches, 0)
+                .sum(dim=-1)
+            )
+        else:
+            draft_support_logits = scaled_draft[rows, safe_draft_rows].gather(
+                -1, selected_token_ids
+            )
+            draft_probs = torch.exp(
+                draft_support_logits - draft_lse[rows, safe_draft_rows, None]
+            )
+    all_accepted = uncapped_correct_len == gamma
+    residual = torch.where(
+        all_accepted[:, None],
+        target_probs,
+        (target_probs - draft_probs).clamp_min(0),
+    )
+    residual = torch.nan_to_num(residual, nan=0.0, posinf=0.0, neginf=0.0)
+    residual_sum = residual.sum(dim=-1, keepdim=True)
+    fallback = (~torch.isfinite(residual_sum)) | (residual_sum <= 0)
+    target_fallback = torch.nan_to_num(
+        target_probs, nan=0.0, posinf=0.0, neginf=0.0
+    ).clamp_min(0)
+    target_sum = target_fallback.sum(dim=-1, keepdim=True)
+    target_fallback[:, 0].add_((target_sum <= 0).squeeze(-1).to(target_fallback.dtype))
+    residual = torch.where(fallback, target_fallback, residual)
+    residual_sum = residual.sum(dim=-1, keepdim=True)
+
+    if uniform_samples_final is None:
+        uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
+    else:
+        uniform_samples_final = uniform_samples_final.to(
+            device=device, dtype=torch.float32
+        )
+    target_u = uniform_samples_final[:, None] * residual_sum
+    final_position = (torch.cumsum(residual, dim=-1) <= target_u).sum(dim=-1)
+    final_position.clamp_(max=residual.shape[-1] - 1)
+    if selected_token_ids is None:
+        final_token = final_position
+    else:
+        final_token = selected_token_ids.gather(-1, final_position[:, None]).squeeze(-1)
+
+    if cutoff_verify_lens is None:
+        correct_len = uncapped_correct_len
+        cap_trim_lens = torch.zeros_like(correct_len)
+    else:
+        max_correct_len = (
+            cutoff_verify_lens.to(
+                device=uncapped_correct_len.device,
+                dtype=uncapped_correct_len.dtype,
+            )
+            - 1
+        )
+        correct_len = torch.minimum(uncapped_correct_len, max_correct_len)
+        cap_trim_lens = uncapped_correct_len - correct_len
+    trimmed = correct_len < uncapped_correct_len
+    next_candidate_col = (correct_len.to(torch.long) + 1).clamp(max=gamma)
+    trimmed_bonus = candidates[rows, next_candidate_col]
+    bonus = torch.where(trimmed, trimmed_bonus, final_token).to(torch.int64)
+    return correct_len, bonus, cap_trim_lens
+
+
 @triton.jit
 def _gather_two_level_bonus_kernel(
     accept_index_ptr,

@@ -23,19 +23,22 @@ class SampleStepTokens:
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
         exp_noise: torch.Tensor,
+        top_k: Optional[int] = None,
     ) -> torch.Tensor:
-        if step_logits.is_cuda:
+        if step_logits.is_cuda and top_k is None:
             return cls.triton(
                 step_logits=step_logits,
                 temperatures=temperatures,
                 greedy_mask=greedy_mask,
                 exp_noise=exp_noise,
+                top_k=top_k,
             )
         return cls.torch(
             step_logits=step_logits,
             temperatures=temperatures,
             greedy_mask=greedy_mask,
             exp_noise=exp_noise,
+            top_k=top_k,
         )
 
     @classmethod
@@ -46,12 +49,14 @@ class SampleStepTokens:
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
         exp_noise: torch.Tensor,
+        top_k: Optional[int] = None,
     ) -> torch.Tensor:
         return sample_step_tokens(
             step_logits=step_logits,
             temperatures=temperatures,
             greedy_mask=greedy_mask,
             exp_noise=exp_noise,
+            top_k=top_k,
         )
 
     @classmethod
@@ -62,7 +67,16 @@ class SampleStepTokens:
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
         exp_noise: torch.Tensor,
+        top_k: Optional[int] = None,
     ) -> torch.Tensor:
+        if top_k is not None:
+            return cls.torch(
+                step_logits=step_logits,
+                temperatures=temperatures,
+                greedy_mask=greedy_mask,
+                exp_noise=exp_noise,
+                top_k=top_k,
+            )
         return sample_step_tokens_triton(
             step_logits=step_logits,
             temperatures=temperatures,
@@ -77,7 +91,26 @@ def sample_step_tokens(
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
     exp_noise: torch.Tensor,
+    top_k: Optional[int] = None,
 ) -> torch.Tensor:
+    if top_k is not None:
+        vocab_size = int(step_logits.shape[-1])
+        top_k = max(1, min(int(top_k), vocab_size))
+        topk_logits, topk_ids = torch.topk(step_logits, k=top_k, dim=-1)
+        probs = torch.softmax(topk_logits.float() / temperatures[:, None], dim=-1)
+        if exp_noise.shape[-1] == vocab_size:
+            selected_noise = exp_noise.gather(-1, topk_ids)
+        elif exp_noise.shape[-1] == top_k:
+            selected_noise = exp_noise
+        else:
+            raise ValueError(
+                "DSpark top-k proposal noise width mismatch: "
+                f"expected {top_k} or {vocab_size}, got {exp_noise.shape[-1]}."
+            )
+        noise = torch.where(greedy_mask[:, None], 1.0, selected_noise)
+        selected = probs.div_(noise).argmax(dim=-1, keepdim=True)
+        return topk_ids.gather(-1, selected).squeeze(-1)
+
     probs = torch.softmax(step_logits.float() / temperatures[:, None], dim=-1)
     noise = torch.where(greedy_mask[:, None], 1.0, exp_noise)
     return probs.div_(noise).argmax(dim=-1)

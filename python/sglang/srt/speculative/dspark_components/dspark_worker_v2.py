@@ -1,4 +1,6 @@
 import logging
+import os
+from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Optional
@@ -62,6 +64,153 @@ from sglang.srt.utils import get_available_gpu_memory, is_cuda
 logger = logging.getLogger(__name__)
 
 
+class _PPDraftLogitsCacheEntry:
+    __slots__ = ("corrected_logits", "draft_tokens", "num_rows")
+
+    def __init__(
+        self,
+        *,
+        corrected_logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+    ) -> None:
+        # Graph replay can reuse proposal outputs before a PP ring trip completes.
+        self.corrected_logits = corrected_logits.detach().clone()
+        self.draft_tokens = draft_tokens.detach().clone()
+        self.num_rows = int(corrected_logits.shape[0])
+
+
+class _PPDraftLogitsCache:
+    """Last-stage cache for draft distributions relayed by compact handles."""
+
+    def __init__(self, *, max_rows: int) -> None:
+        self.max_rows = max(int(max_rows), 1)
+        self._entries: OrderedDict[int, _PPDraftLogitsCacheEntry] = OrderedDict()
+        self._next_id = 1
+        self._num_rows = 0
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._num_rows = 0
+
+    def put(
+        self,
+        *,
+        corrected_logits: Optional[torch.Tensor],
+        draft_tokens: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if corrected_logits is None:
+            return None, None
+        if corrected_logits.ndim != 3:
+            raise ValueError(
+                "DSpark PP cached draft logits must be rank 3, got "
+                f"{tuple(corrected_logits.shape)}."
+            )
+        if corrected_logits.shape[:2] != draft_tokens.shape:
+            raise ValueError(
+                "DSpark PP cached draft logits/token shape mismatch: "
+                f"logits={tuple(corrected_logits.shape)}, "
+                f"tokens={tuple(draft_tokens.shape)}."
+            )
+
+        num_rows = int(corrected_logits.shape[0])
+        while self._entries and self._num_rows + num_rows > self.max_rows:
+            _, stale = self._entries.popitem(last=False)
+            self._num_rows -= stale.num_rows
+            self.evictions += 1
+
+        cache_id = self._next_id
+        self._next_id += 1
+        self._entries[cache_id] = _PPDraftLogitsCacheEntry(
+            corrected_logits=corrected_logits,
+            draft_tokens=draft_tokens,
+        )
+        self._num_rows += num_rows
+        return (
+            torch.full((num_rows,), cache_id, dtype=torch.int64),
+            torch.arange(num_rows, dtype=torch.int64),
+        )
+
+    def take(
+        self,
+        *,
+        cache_ids,
+        cache_rows,
+        expected_draft_tokens: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if cache_ids is None or cache_rows is None:
+            self.misses += 1
+            return None
+        ids = (
+            cache_ids.to("cpu", dtype=torch.int64).tolist()
+            if isinstance(cache_ids, torch.Tensor)
+            else [int(value) for value in cache_ids]
+        )
+        rows = (
+            cache_rows.to("cpu", dtype=torch.int64).tolist()
+            if isinstance(cache_rows, torch.Tensor)
+            else [int(value) for value in cache_rows]
+        )
+        if len(ids) != len(rows) or len(ids) != expected_draft_tokens.shape[0]:
+            self.misses += 1
+            return None
+        if not ids or any(cache_id < 0 for cache_id in ids):
+            self.misses += 1
+            return None
+
+        used_ids = set(ids)
+        entries = {cache_id: self._entries.get(cache_id) for cache_id in used_ids}
+        if any(entry is None for entry in entries.values()):
+            self.misses += 1
+            return None
+        if any(
+            row < 0 or row >= entries[cache_id].num_rows
+            for cache_id, row in zip(ids, rows)
+        ):
+            self.misses += 1
+            return None
+
+        for cache_id in used_ids:
+            entry = self._entries.pop(cache_id)
+            self._num_rows -= entry.num_rows
+
+        first_entry = entries[ids[0]]
+        if (
+            len(used_ids) == 1
+            and rows == list(range(first_entry.num_rows))
+            and len(rows) == first_entry.num_rows
+        ):
+            corrected_logits = first_entry.corrected_logits
+            cached_tokens = first_entry.draft_tokens
+        else:
+            corrected_logits = torch.cat(
+                [
+                    entries[cache_id].corrected_logits[row : row + 1]
+                    for cache_id, row in zip(ids, rows)
+                ],
+                dim=0,
+            )
+            cached_tokens = torch.cat(
+                [
+                    entries[cache_id].draft_tokens[row : row + 1]
+                    for cache_id, row in zip(ids, rows)
+                ],
+                dim=0,
+            )
+
+        if corrected_logits.shape[:2] != expected_draft_tokens.shape:
+            self.misses += 1
+            return None
+        if os.getenv("SGLANG_DSPARK_PP_VALIDATE_DRAFT_LOGITS_CACHE", "0") == "1":
+            if not torch.equal(cached_tokens, expected_draft_tokens):
+                self.misses += 1
+                return None
+        self.hits += 1
+        return corrected_logits
+
+
 class DSparkWorkerV2(BaseSpecWorker):
 
     def __init__(
@@ -83,6 +232,22 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._pp_is_last_rank = target_worker.pp_group.is_last_rank
         self._pp_enabled = server_args.pp_size > 1
+        self._pp_retain_draft_logits = (
+            self._pp_enabled
+            and self._pp_is_last_rank
+            and envs.SGLANG_DSPARK_PP_RETAIN_DRAFT_LOGITS.get()
+        )
+        self._pp_draft_logits_cache = _PPDraftLogitsCache(
+            max_rows=int(server_args.max_running_requests)
+        )
+        if self._pp_is_last_rank and self.ps.tp_rank == 0:
+            logger.info(
+                "DSpark PP non-greedy verification: retain_draft_logits=%s "
+                "fast_rejection=%s cache_max_rows=%d",
+                self._pp_retain_draft_logits,
+                envs.SGLANG_DSPARK_PP_FAST_REJECTION.get(),
+                self._pp_draft_logits_cache.max_rows,
+            )
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
         self._draft_dp_context_enabled = (
@@ -192,7 +357,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=self.ps.tp_rank,
             server_args=self.server_args,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
-            pp_enabled=self._pp_enabled,
+            authoritative_scheduler=not self._pp_enabled or self._pp_is_last_rank,
         )
         if (
             server_args.enable_dp_attention
@@ -384,7 +549,54 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def clear_cache_pool(self):
-        pass
+        self._pp_draft_logits_cache.clear()
+
+    def _cache_pp_draft_logits(
+        self,
+        *,
+        draft_block: DraftBlockResult,
+        sampling_info,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if (
+            not self._pp_retain_draft_logits
+            or sampling_info is None
+            or sampling_info.is_all_greedy
+        ):
+            return None, None
+        return self._pp_draft_logits_cache.put(
+            corrected_logits=draft_block.corrected_logits,
+            draft_tokens=draft_block.draft_tokens,
+        )
+
+    def _restore_pp_draft_logits(
+        self,
+        *,
+        pp_raw: DSparkPPVerifyInputRaw,
+        draft_tokens: torch.Tensor,
+        sampling_info,
+    ) -> Optional[torch.Tensor]:
+        if (
+            not self._pp_retain_draft_logits
+            or sampling_info is None
+            or sampling_info.is_all_greedy
+        ):
+            return None
+        corrected_logits = self._pp_draft_logits_cache.take(
+            cache_ids=pp_raw.draft_logits_cache_ids,
+            cache_rows=pp_raw.draft_logits_cache_rows,
+            expected_draft_tokens=draft_tokens,
+        )
+        total = self._pp_draft_logits_cache.hits + self._pp_draft_logits_cache.misses
+        if self.ps.tp_rank == 0 and (
+            total in (1, 10, 100) or (total > 0 and total % 1000 == 0)
+        ):
+            logger.info(
+                "DSpark PP draft-logits cache: hits=%d misses=%d evictions=%d",
+                self._pp_draft_logits_cache.hits,
+                self._pp_draft_logits_cache.misses,
+                self._pp_draft_logits_cache.evictions,
+            )
+        return corrected_logits
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
@@ -534,14 +746,20 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _draft_block_from_pp_raw(self, pp_raw, batch, sampling_info):
-        # PP path: rebuild verify candidates + a placeholder draft block from
-        # the last rank's relayed raw. Under the all-greedy commit guard the
-        # accept path does not read corrected_logits, so a None placeholder is
-        # safe; only shape-compatible temperatures/greedy_mask are needed.
         device = batch.seq_lens.device
         bs = len(batch.seq_lens)
-        bonus = torch.tensor(pp_raw.bonus_tokens, device=device, dtype=torch.int64)
-        drafts = torch.tensor(pp_raw.draft_tokens, device=device, dtype=torch.int64)
+        bonus = torch.as_tensor(pp_raw.bonus_tokens, device=device, dtype=torch.int64)
+        drafts = torch.as_tensor(pp_raw.draft_tokens, device=device, dtype=torch.int64)
+        if bonus.shape != (bs,):
+            raise RuntimeError(
+                "DSpark PP bonus-token shape mismatch: "
+                f"expected={(bs,)}, got={tuple(bonus.shape)}."
+            )
+        if drafts.shape != (bs, self.gamma):
+            raise RuntimeError(
+                "DSpark PP draft-token shape mismatch: "
+                f"expected={(bs, self.gamma)}, got={tuple(drafts.shape)}."
+            )
         draft_block_ids = bonus.unsqueeze(1)
         if sampling_info is not None:
             temperatures = (
@@ -551,17 +769,26 @@ class DSparkWorkerV2(BaseSpecWorker):
             temperatures = torch.ones(bs, dtype=torch.float32, device=device)
         draft_block = DraftBlockResult(
             draft_tokens=drafts,
-            corrected_logits=None,
+            corrected_logits=self._restore_pp_draft_logits(
+                pp_raw=pp_raw,
+                draft_tokens=drafts,
+                sampling_info=sampling_info,
+            ),
             greedy_mask=resolve_greedy_mask(
                 bs=bs, sampling_info=sampling_info, device=device
             ),
             temperatures=temperatures,
         )
         confidence = (
-            torch.tensor(pp_raw.confidence, device=device, dtype=torch.float32)
+            torch.as_tensor(pp_raw.confidence, device=device, dtype=torch.float32)
             if pp_raw.confidence is not None
             else None
         )
+        if confidence is not None and confidence.shape != (bs, self.gamma):
+            raise RuntimeError(
+                "DSpark PP confidence shape mismatch: "
+                f"expected={(bs, self.gamma)}, got={tuple(confidence.shape)}."
+            )
         return draft_block_ids, draft_block, drafts, confidence
 
     def _forward_decode(
@@ -640,13 +867,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 confidence,
             ) = self._draft_block_from_pp_raw(pp_raw, batch, sampling_info)
 
-        verify_token_budget = self._verify_planner.resolve_verify_token_budget(
-            draft_input=draft_input,
-            confidence=confidence,
-            prefix_lens=prefix_lens,
-            req_pool_indices=batch.req_pool_indices,
-        )
-
         global_num_reqs = (
             max(batch.global_num_tokens)
             if self._draft_is_moe
@@ -654,21 +874,35 @@ class DSparkWorkerV2(BaseSpecWorker):
             and batch.global_num_tokens is not None
             else None
         )
-        layout = self._verify_planner.schedule_layout(
-            req_pool_indices=batch.req_pool_indices,
-            prefix_lens=prefix_lens,
-            device=device,
-            confidence=confidence,
-            budget=verify_token_budget,
-            global_num_reqs=global_num_reqs,
-            dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
-        )
+        if pp_raw is not None and not self._verify_planner.is_static_mode:
+            relayed_verify_lens = pp_raw.next_verify_lens
+            if relayed_verify_lens is None:
+                relayed_verify_lens = [self.verify_num_draft_tokens] * bs
+            verify_token_budget = self._verify_planner.verify_budget_from_lens(
+                relayed_verify_lens
+            )
+            layout = self._verify_planner.layout_from_relayed_verify_lens(
+                verify_lens=relayed_verify_lens,
+                expected_bs=bs,
+                device=device,
+            )
+        else:
+            verify_token_budget = self._verify_planner.resolve_verify_token_budget(
+                draft_input=draft_input,
+                confidence=confidence,
+                prefix_lens=prefix_lens,
+                req_pool_indices=batch.req_pool_indices,
+            )
+            layout = self._verify_planner.schedule_layout(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                device=device,
+                confidence=confidence,
+                budget=verify_token_budget,
+                global_num_reqs=global_num_reqs,
+                dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
-        # PP forces non-compact (eager) verify: cuda-graph compact verify is not
-        # supported under PP yet, and uniform layout identity is required across
-        # PP ranks.
-        if self._pp_enabled:
-            run_compact = False
 
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1
@@ -692,6 +926,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     device=device,
                     sampling_info=sampling_info,
                     inject_gate=fold_eligible,
+                    pp_proxy_tensors=pp_proxy_tensors,
                 )
             else:
                 target_verify = self._verify_executor.run_non_compact(
@@ -721,17 +956,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
                 pp_verify_input_raw=None,
-            )
-
-        # PP all-greedy commit guard: sampled commit needs draft_block.
-        # corrected_logits (produced from draft hidden this step, not carryable
-        # via raw), so PP currently supports greedy commit only.
-        if self._pp_enabled and not (
-            sampling_info is None or sampling_info.is_all_greedy
-        ):
-            raise ValueError(
-                "DSpark PP currently supports greedy-commit only; non-greedy "
-                "sampling under PP needs corrected_logits replay (not in scope)."
             )
 
         epilogue = self._verify_executor.verify_epilogue
@@ -795,6 +1019,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
         )
+        next_draft_input.max_top_k = getattr(draft_input, "max_top_k", 1)
+        next_draft_input.uniform_top_k_value = getattr(
+            draft_input, "uniform_top_k_value", None
+        )
 
         pp_raw_out = None
         if self._pp_enabled:
@@ -825,17 +1053,55 @@ class DSparkWorkerV2(BaseSpecWorker):
                     draft_tokens=proposal_next.draft_block.draft_tokens,
                     confidence_tap=proposal_next.confidence_tap,
                 )
+            next_verify_lens = [self.verify_num_draft_tokens] * bs
+            if not self._verify_planner.is_static_mode:
+                next_verify_token_budget = (
+                    self._verify_planner.compute_budget_sync(
+                        confidence=con,
+                        prefix_lens=accept.new_seq_lens,
+                        req_pool_indices=batch.req_pool_indices,
+                    )
+                    if con is not None
+                    else None
+                )
+                next_layout = self._verify_planner.schedule_layout(
+                    req_pool_indices=batch.req_pool_indices,
+                    prefix_lens=accept.new_seq_lens,
+                    device=device,
+                    confidence=con,
+                    budget=next_verify_token_budget,
+                )
+                next_verify_lens = self._verify_planner.verify_lens_for_pp_relay(
+                    layout=next_layout,
+                    bs=bs,
+                )
+            if layout is None:
+                verify_lens = torch.full(
+                    (bs,),
+                    self.verify_num_draft_tokens,
+                    dtype=torch.int64,
+                )
+            elif layout.verify_lens_cpu is not None:
+                verify_lens = torch.as_tensor(layout.verify_lens_cpu, dtype=torch.int64)
+            else:
+                verify_lens = layout.verify_lens.to("cpu", dtype=torch.int64)
+            cache_ids, cache_rows = self._cache_pp_draft_logits(
+                draft_block=proposal_next.draft_block,
+                sampling_info=sampling_info,
+            )
             pp_raw_out = DSparkPPVerifyInputRaw(
-                bonus_tokens=accept.bonus.tolist(),
-                draft_tokens=proposal_next.draft_block.draft_tokens.tolist(),
-                new_seq_lens=accept.new_seq_lens.tolist(),
-                confidence=(con.tolist() if con is not None else None),
-                accept_lens=accept.commit_lens.tolist(),
-                cap_trim_lens=accept.cap_trim_lens.tolist(),
-                verify_lens=(
-                    layout.verify_lens.tolist() if layout is not None else None
-                ),
-                accept_index=None,
+                bonus_tokens=accept.bonus,
+                draft_tokens=proposal_next.draft_block.draft_tokens,
+                new_seq_lens=accept.new_seq_lens,
+                accept_lens=accept.commit_lens,
+                max_top_k=getattr(draft_input, "max_top_k", 1),
+                uniform_top_k_value=getattr(draft_input, "uniform_top_k_value", None),
+                confidence=con,
+                cap_trim_lens=accept.cap_trim_lens,
+                verify_lens=verify_lens,
+                next_verify_lens=torch.as_tensor(next_verify_lens, dtype=torch.int64),
+                draft_logits_cache_ids=cache_ids,
+                draft_logits_cache_rows=cache_rows,
             )
 
         return GenerationBatchResult(

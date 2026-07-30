@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import copy
+import logging
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -14,7 +17,10 @@ from sglang.srt.speculative.dflash_info_v2 import (
     DFlashDecodePrepareMixin,
     DFlashDraftInputV2,
 )
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_verify_logits_adjustments,
+    compute_dflash_sampling_correct_drafts_and_bonus,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -30,6 +36,8 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
     SelectMixedAccept,
     SoftmaxTemp,
     accept_greedy_triton,
+    accept_sampling_logits_fast,
+    build_uniform_topk_probs,
     finalize_accept_lens_triton,
 )
 from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
@@ -42,6 +50,9 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window impor
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+
+logger = logging.getLogger(__name__)
+_PP_FAST_REJECTION_LOGGED = False
 
 
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
@@ -70,123 +81,258 @@ class TargetVerifyResult(msgspec.Struct, frozen=True):
 
 @dataclass
 class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
-    """DSpark PP relay data carrier.
+    """Serializable DSpark state relayed around the pipeline output ring."""
 
-    Carries the draft / confidence / accounting information produced by the
-    last PP rank each iter and relays it to every verify rank via the PP ring,
-    so that all ranks rebuild an identical verify context for the next iter.
-    Linear (non-tree) verify reuses the formal ``req_to_token`` slots, so
-    ``accept_index`` is always ``None`` and ``batch_result_processor`` skips
-    the token-move step automatically.
-    """
-
-    # Draft info for rebuilding the next iter's verify candidates on every rank.
-    bonus_tokens: List[int]
-    draft_tokens: List[List[int]]
-    new_seq_lens: List[int]
-
-    # Result / accounting for batch_result_processor and stats. Required: always
-    # populated by the last rank (even build_dummy_for_decode sets [1]*bs).
-    accept_lens: List[int]
-
-    # Optional placeholders mirroring DFlashDraftInputV2 so that run_non_compact's
-    # elif branch (reading reserved_seq_lens_cpu when batch.seq_lens_cpu is None)
-    # never AttributeErrors under PP. Steady-state decode does not trigger it.
-    reserved_seq_lens_cpu: Optional[List] = None
+    bonus_tokens: List[int] | torch.Tensor
+    draft_tokens: List[List[int]] | torch.Tensor
+    new_seq_lens: List[int] | torch.Tensor
+    accept_lens: List[int] | torch.Tensor
+    max_top_k: int = 1
+    uniform_top_k_value: Optional[int] = None
+    reserved_seq_lens_cpu: Optional[List[int] | torch.Tensor] = None
     reserved_seq_lens_sum: Optional[int] = None
+    confidence: Optional[List[List[float]] | torch.Tensor] = None
+    cap_trim_lens: Optional[List[int] | torch.Tensor] = None
+    verify_lens: Optional[List[int] | torch.Tensor] = None
+    next_verify_lens: Optional[List[int] | torch.Tensor] = None
+    accept_index: Optional[List | torch.Tensor] = None
+    draft_logits_cache_ids: Optional[List[int] | torch.Tensor] = None
+    draft_logits_cache_rows: Optional[List[int] | torch.Tensor] = None
 
-    # Confidence produced by last rank's propose; all ranks recompute an
-    # identical verify budget from the same source each iter.
-    confidence: Optional[List[float]] = None
-
-    cap_trim_lens: Optional[List[int]] = None
-    verify_lens: Optional[List[int]] = None
-
-    # Linear verify: always None so batch_result_processor skips the token move.
-    accept_index: Optional[List] = None
-
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         super().__init__(SpecInputType.DFLASH_PP_VERIFY_INPUT_RAW)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return (1, 1)
 
-    def to_tensor_dict(self) -> dict:
-        return {"pp_spec_output": asdict(self)}
+    @staticmethod
+    def _to_list(value):
+        if isinstance(value, torch.Tensor):
+            return DSparkPPVerifyInputRaw._to_list(value.tolist())
+        if isinstance(value, dict):
+            return {
+                key: DSparkPPVerifyInputRaw._to_list(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [DSparkPPVerifyInputRaw._to_list(item) for item in value]
+        return value
+
+    @staticmethod
+    def _as_tensor(value, *, dtype: torch.dtype, device=None):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.to(dtype=dtype)
+        return torch.tensor(value, dtype=dtype, device=device)
+
+    def to_tensor_dict(self, device=None) -> dict:
+        payload = {
+            "dspark_pp_spec_version": 2,
+            "dspark_pp_bonus_tokens": self._as_tensor(
+                self.bonus_tokens, dtype=torch.int64, device=device
+            ),
+            "dspark_pp_draft_tokens": self._as_tensor(
+                self.draft_tokens, dtype=torch.int64, device=device
+            ),
+            "dspark_pp_new_seq_lens": self._as_tensor(
+                self.new_seq_lens, dtype=torch.int64, device=device
+            ),
+            "dspark_pp_accept_lens": self._as_tensor(
+                self.accept_lens, dtype=torch.int64, device=device
+            ),
+            "dspark_pp_max_top_k": self.max_top_k,
+            "dspark_pp_uniform_top_k_value": self.uniform_top_k_value,
+            "dspark_pp_reserved_seq_lens_sum": self.reserved_seq_lens_sum,
+            "dspark_pp_accept_index": self._to_list(self.accept_index),
+        }
+        optional_tensors = (
+            ("reserved_seq_lens_cpu", self.reserved_seq_lens_cpu, torch.int64),
+            ("confidence", self.confidence, torch.float32),
+            ("cap_trim_lens", self.cap_trim_lens, torch.int64),
+            ("verify_lens", self.verify_lens, torch.int64),
+            ("next_verify_lens", self.next_verify_lens, torch.int64),
+            ("draft_logits_cache_ids", self.draft_logits_cache_ids, torch.int64),
+            ("draft_logits_cache_rows", self.draft_logits_cache_rows, torch.int64),
+        )
+        for name, value, dtype in optional_tensors:
+            if value is not None:
+                payload[f"dspark_pp_{name}"] = self._as_tensor(
+                    value, dtype=dtype, device=device
+                )
+        return payload
 
     @classmethod
     def from_pp_outputs(cls, pp_outputs):
-        return cls(**pp_outputs["pp_spec_output"])
+        tensors = pp_outputs.tensors if hasattr(pp_outputs, "tensors") else pp_outputs
+        if "dspark_pp_spec_version" in tensors:
+            return cls(
+                bonus_tokens=tensors["dspark_pp_bonus_tokens"],
+                draft_tokens=tensors["dspark_pp_draft_tokens"],
+                new_seq_lens=tensors["dspark_pp_new_seq_lens"],
+                accept_lens=tensors["dspark_pp_accept_lens"],
+                max_top_k=tensors.get("dspark_pp_max_top_k", 1),
+                uniform_top_k_value=tensors.get("dspark_pp_uniform_top_k_value"),
+                reserved_seq_lens_cpu=tensors.get("dspark_pp_reserved_seq_lens_cpu"),
+                reserved_seq_lens_sum=tensors.get("dspark_pp_reserved_seq_lens_sum"),
+                confidence=tensors.get("dspark_pp_confidence"),
+                cap_trim_lens=tensors.get("dspark_pp_cap_trim_lens"),
+                verify_lens=tensors.get("dspark_pp_verify_lens"),
+                next_verify_lens=tensors.get("dspark_pp_next_verify_lens"),
+                accept_index=tensors.get("dspark_pp_accept_index"),
+                draft_logits_cache_ids=tensors.get("dspark_pp_draft_logits_cache_ids"),
+                draft_logits_cache_rows=tensors.get(
+                    "dspark_pp_draft_logits_cache_rows"
+                ),
+            )
+        return cls(**tensors["pp_spec_output"])
+
+    @staticmethod
+    def is_in_tensor_dict(tensors: dict) -> bool:
+        return "dspark_pp_spec_version" in tensors or "pp_spec_output" in tensors
 
     @classmethod
     def build_dummy_for_decode(cls, batch, num_draft: int) -> DSparkPPVerifyInputRaw:
-        # First decode step: the last PP rank has not proposed real drafts yet.
         bs = len(batch.reqs)
         gamma = max(num_draft - 1, 0)
-        bonus = batch.input_ids.tolist()
+        bonus = batch.input_ids.to(torch.int64)
         return cls(
             bonus_tokens=bonus,
-            draft_tokens=[bonus[i : i + 1] * gamma for i in range(bs)],
-            new_seq_lens=batch.seq_lens.tolist(),
-            confidence=[0.0] * bs,
-            accept_lens=[1] * bs,
-            cap_trim_lens=[0] * bs,
-            verify_lens=[num_draft] * bs,
-            accept_index=None,
+            draft_tokens=bonus[:, None].expand(bs, gamma).clone(),
+            new_seq_lens=batch.seq_lens.to(torch.int64),
+            confidence=torch.zeros(
+                (bs, gamma), dtype=torch.float32, device=bonus.device
+            ),
+            accept_lens=torch.ones(bs, dtype=torch.int64, device=bonus.device),
+            cap_trim_lens=torch.zeros(bs, dtype=torch.int64, device=bonus.device),
+            verify_lens=torch.full(
+                (bs,), num_draft, dtype=torch.int64, device=bonus.device
+            ),
+            next_verify_lens=torch.full(
+                (bs,), num_draft, dtype=torch.int64, device=bonus.device
+            ),
         )
 
     def filter_batch(self, new_indices, new_indices_cpu: Optional[List[int]] = None):
-        idx = (
-            new_indices.tolist() if torch.is_tensor(new_indices) else list(new_indices)
-        )
+        raw_indices = new_indices_cpu if new_indices_cpu is not None else new_indices
+        indices = None
 
-        def pick(lst):
-            return [lst[i] for i in idx]
+        def list_indices():
+            nonlocal indices
+            if indices is None:
+                if isinstance(raw_indices, torch.Tensor):
+                    indices = raw_indices.tolist()
+                else:
+                    indices = [int(index) for index in raw_indices]
+            return indices
+
+        def pick(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                source_indices = (
+                    new_indices
+                    if isinstance(new_indices, torch.Tensor)
+                    else raw_indices
+                )
+                index = torch.as_tensor(
+                    source_indices, dtype=torch.long, device=value.device
+                )
+                return value.index_select(0, index)
+            return [value[index] for index in list_indices()]
 
         self.bonus_tokens = pick(self.bonus_tokens)
-        if self.draft_tokens is not None:
-            self.draft_tokens = pick(self.draft_tokens)
-        if self.new_seq_lens is not None:
-            self.new_seq_lens = pick(self.new_seq_lens)
-        if self.confidence is not None:
-            self.confidence = pick(self.confidence)
-        if self.accept_lens is not None:
-            self.accept_lens = pick(self.accept_lens)
-        if self.cap_trim_lens is not None:
-            self.cap_trim_lens = pick(self.cap_trim_lens)
-        if self.verify_lens is not None:
-            self.verify_lens = pick(self.verify_lens)
-        if self.accept_index is not None:
-            self.accept_index = [self.accept_index[i] for i in idx]
+        self.draft_tokens = pick(self.draft_tokens)
+        self.new_seq_lens = pick(self.new_seq_lens)
+        self.accept_lens = pick(self.accept_lens)
+        self.reserved_seq_lens_cpu = pick(self.reserved_seq_lens_cpu)
+        self.confidence = pick(self.confidence)
+        self.cap_trim_lens = pick(self.cap_trim_lens)
+        self.verify_lens = pick(self.verify_lens)
+        self.next_verify_lens = pick(self.next_verify_lens)
+        self.accept_index = pick(self.accept_index)
+        self.draft_logits_cache_ids = pick(self.draft_logits_cache_ids)
+        self.draft_logits_cache_rows = pick(self.draft_logits_cache_rows)
+        if self.reserved_seq_lens_cpu is not None:
+            self.reserved_seq_lens_sum = int(
+                torch.as_tensor(self.reserved_seq_lens_cpu).sum().item()
+            )
+        else:
+            self.reserved_seq_lens_sum = None
 
     def merge_batch(self, other: DSparkPPVerifyInputRaw):
-        if not other.bonus_tokens:
+        def is_empty(value) -> bool:
+            return value is None or len(value) == 0
+
+        def copy_value(value):
+            return value if isinstance(value, torch.Tensor) else self._to_list(value)
+
+        if is_empty(other.bonus_tokens):
             return
-        if not self.bonus_tokens:
-            self.bonus_tokens = other.bonus_tokens
-            self.draft_tokens = other.draft_tokens
-            self.new_seq_lens = other.new_seq_lens
-            self.confidence = other.confidence
-            self.accept_lens = other.accept_lens
-            self.cap_trim_lens = other.cap_trim_lens
-            self.verify_lens = other.verify_lens
-            self.accept_index = other.accept_index
+        if is_empty(self.bonus_tokens):
+            self.bonus_tokens = copy_value(other.bonus_tokens)
+            self.draft_tokens = copy_value(other.draft_tokens)
+            self.new_seq_lens = copy_value(other.new_seq_lens)
+            self.accept_lens = copy_value(other.accept_lens)
+            self.max_top_k = other.max_top_k
+            self.uniform_top_k_value = other.uniform_top_k_value
+            self.reserved_seq_lens_cpu = copy_value(other.reserved_seq_lens_cpu)
+            self.reserved_seq_lens_sum = other.reserved_seq_lens_sum
+            self.confidence = copy_value(other.confidence)
+            self.cap_trim_lens = copy_value(other.cap_trim_lens)
+            self.verify_lens = copy_value(other.verify_lens)
+            self.next_verify_lens = copy_value(other.next_verify_lens)
+            self.accept_index = copy_value(other.accept_index)
+            self.draft_logits_cache_ids = copy_value(other.draft_logits_cache_ids)
+            self.draft_logits_cache_rows = copy_value(other.draft_logits_cache_rows)
             return
-        self.bonus_tokens = self.bonus_tokens + other.bonus_tokens
-        if other.draft_tokens is not None:
-            self.draft_tokens = self.draft_tokens + other.draft_tokens
-        if other.new_seq_lens is not None:
-            self.new_seq_lens = self.new_seq_lens + other.new_seq_lens
-        if self.confidence is not None and other.confidence is not None:
-            self.confidence = self.confidence + other.confidence
-        if self.accept_lens is not None and other.accept_lens is not None:
-            self.accept_lens = self.accept_lens + other.accept_lens
-        if self.cap_trim_lens is not None and other.cap_trim_lens is not None:
-            self.cap_trim_lens = self.cap_trim_lens + other.cap_trim_lens
-        if self.verify_lens is not None and other.verify_lens is not None:
-            self.verify_lens = self.verify_lens + other.verify_lens
-        if self.accept_index is not None and other.accept_index is not None:
-            self.accept_index = self.accept_index + other.accept_index
+
+        def merge_required(lhs, rhs):
+            if isinstance(lhs, torch.Tensor) or isinstance(rhs, torch.Tensor):
+                template = lhs if isinstance(lhs, torch.Tensor) else rhs
+                lhs_tensor = torch.as_tensor(
+                    lhs, dtype=template.dtype, device=template.device
+                )
+                rhs_tensor = torch.as_tensor(
+                    rhs, dtype=template.dtype, device=template.device
+                )
+                return torch.cat((lhs_tensor, rhs_tensor), dim=0)
+            return self._to_list(lhs) + self._to_list(rhs)
+
+        def merge_optional(lhs, rhs):
+            if lhs is None or rhs is None:
+                return None
+            return merge_required(lhs, rhs)
+
+        self.bonus_tokens = merge_required(self.bonus_tokens, other.bonus_tokens)
+        self.draft_tokens = merge_required(self.draft_tokens, other.draft_tokens)
+        self.new_seq_lens = merge_required(self.new_seq_lens, other.new_seq_lens)
+        self.accept_lens = merge_required(self.accept_lens, other.accept_lens)
+        self.max_top_k = max(self.max_top_k, other.max_top_k)
+        if self.uniform_top_k_value != other.uniform_top_k_value:
+            self.uniform_top_k_value = None
+        self.reserved_seq_lens_cpu = merge_optional(
+            self.reserved_seq_lens_cpu, other.reserved_seq_lens_cpu
+        )
+        self.confidence = merge_optional(self.confidence, other.confidence)
+        self.cap_trim_lens = merge_optional(self.cap_trim_lens, other.cap_trim_lens)
+        self.verify_lens = merge_optional(self.verify_lens, other.verify_lens)
+        self.next_verify_lens = merge_optional(
+            self.next_verify_lens, other.next_verify_lens
+        )
+        self.accept_index = merge_optional(self.accept_index, other.accept_index)
+        self.draft_logits_cache_ids = merge_optional(
+            self.draft_logits_cache_ids, other.draft_logits_cache_ids
+        )
+        self.draft_logits_cache_rows = merge_optional(
+            self.draft_logits_cache_rows, other.draft_logits_cache_rows
+        )
+        if self.reserved_seq_lens_cpu is not None:
+            self.reserved_seq_lens_sum = int(
+                torch.as_tensor(self.reserved_seq_lens_cpu).sum().item()
+            )
+        else:
+            self.reserved_seq_lens_sum = None
 
 
 class TargetVerifyExecutor:
@@ -458,6 +604,7 @@ class TargetVerifyExecutor:
         layout: RaggedVerifyLayout,
         ragged_window: RaggedVerifyWindow,
         sampling_info,
+        pp_proxy_tensors=None,
     ) -> TargetVerifyResult:
         verify_input = DFlashVerifyInput(
             draft_token=ragged_window.verify_ids,
@@ -486,6 +633,7 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
     def run_compact(
@@ -499,7 +647,8 @@ class TargetVerifyExecutor:
         device: str,
         sampling_info,
         inject_gate: bool = False,
-    ) -> tuple[TargetVerifyResult, torch.Tensor]:
+        pp_proxy_tensors=None,
+    ) -> tuple[TargetVerifyResult, Optional[torch.Tensor]]:
         ragged_window = BuildRaggedVerifyWindow.execute(
             batch=batch,
             layout=layout,
@@ -517,8 +666,11 @@ class TargetVerifyExecutor:
             layout=layout,
             ragged_window=ragged_window,
             sampling_info=sampling_info,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         logits_output = target_verify.logits_output
+        if logits_output is None:
+            return target_verify, None
 
         stride = self.verify_num_draft_tokens
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
@@ -795,11 +947,13 @@ def accept_draft_tokens(
     target_logits: torch.Tensor,
     draft_block: DraftBlockResult,
     sampling_info,
-    draft_input: DFlashDraftInputV2,
+    draft_input: DFlashDraftInputV2 | DSparkPPVerifyInputRaw,
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    global _PP_FAST_REJECTION_LOGGED
+
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy
@@ -810,12 +964,75 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
+    if draft_block.corrected_logits is None:
+        if not isinstance(draft_input, DSparkPPVerifyInputRaw):
+            raise RuntimeError(
+                "DSpark non-greedy verification requires draft logits outside PP."
+            )
+        # A missing or evicted cache entry keeps progressing through target-only
+        # verification, at the cost of a lower acceptance rate.
+        return _accept_target_only_draft_tokens(
+            candidates=candidates,
+            target_logits=target_logits,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
+    draft_top_k = None
+    uniform_top_k_value = getattr(draft_input, "uniform_top_k_value", None)
+    max_top_k = getattr(draft_input, "max_top_k", None)
+    if (
+        envs.SGLANG_DSPARK_DRAFT_TOPK_SAMPLING.get()
+        and sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+        and not getattr(sampling_info, "need_min_p_sampling", False)
+        and uniform_top_k_value is not None
+        and int(uniform_top_k_value) == int(max_top_k or -1)
+        and 1 < int(uniform_top_k_value) < int(draft_block.corrected_logits.shape[-1])
+    ):
+        draft_top_k = int(uniform_top_k_value)
+    if (
+        isinstance(draft_input, DSparkPPVerifyInputRaw)
+        and envs.SGLANG_DSPARK_PP_FAST_REJECTION.get()
+        and not sampling_info.is_any_greedy
+        and not sampling_info.need_top_p_sampling
+        and not getattr(sampling_info, "need_min_p_sampling", False)
+    ):
+        if not _PP_FAST_REJECTION_LOGGED:
+            logger.info(
+                "DSpark PP fast rejection is active: top_k=%s max_top_k=%s",
+                sampling_info.need_top_k_sampling,
+                draft_input.max_top_k,
+            )
+            _PP_FAST_REJECTION_LOGGED = True
+        return accept_sampling_logits_fast(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_logits=draft_block.corrected_logits,
+            temperatures=draft_block.temperatures,
+            top_ks=(
+                sampling_info.top_ks if sampling_info.need_top_k_sampling else None
+            ),
+            max_top_k=draft_input.max_top_k,
+            uniform_top_k_value=draft_input.uniform_top_k_value,
+            draft_top_k=draft_top_k,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
     bs, gamma_rows, vocab = draft_block.corrected_logits.shape
-    draft_probs = SoftmaxTemp.execute(
-        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
-        temperatures=draft_block.temperatures,
-        rows_per_request=gamma_rows,
-    ).view(bs, gamma_rows, vocab)
+    if draft_top_k is None:
+        draft_probs = SoftmaxTemp.execute(
+            logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+            temperatures=draft_block.temperatures,
+            rows_per_request=gamma_rows,
+        ).view(bs, gamma_rows, vocab)
+    else:
+        draft_probs = build_uniform_topk_probs(
+            logits=draft_block.corrected_logits,
+            temperatures=draft_block.temperatures,
+            top_k=draft_top_k,
+        )
     if not sampling_info.is_any_greedy:
         return AcceptSampling.execute(
             candidates=candidates,
@@ -853,3 +1070,82 @@ def accept_draft_tokens(
         sampling_trim=sampling_trim,
     )
     return selected.correct_len, selected.bonus, selected.cap_trim_lens
+
+
+def _accept_target_only_draft_tokens(
+    *,
+    candidates: torch.Tensor,
+    target_logits: torch.Tensor,
+    sampling_info,
+    draft_input: DSparkPPVerifyInputRaw,
+    verify_num_draft_tokens: int,
+    cutoff_verify_lens: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Verify PP proposal chains when the retained draft distribution is absent."""
+
+    bs = candidates.shape[0]
+    if candidates.shape[1] != verify_num_draft_tokens:
+        raise ValueError(
+            "DSpark target-only candidate width mismatch: "
+            f"expected={verify_num_draft_tokens}, got={candidates.shape[1]}."
+        )
+    if target_logits.shape[0] != bs * verify_num_draft_tokens:
+        raise ValueError(
+            "DSpark target-only logits row mismatch: "
+            f"expected={bs * verify_num_draft_tokens}, "
+            f"got={target_logits.shape[0]}."
+        )
+
+    if cutoff_verify_lens is None:
+        verify_lens = torch.full(
+            (bs,),
+            verify_num_draft_tokens,
+            dtype=torch.int64,
+            device=candidates.device,
+        )
+    else:
+        verify_lens = cutoff_verify_lens.to(device=candidates.device, dtype=torch.int64)
+        if verify_lens.shape != (bs,):
+            raise ValueError(
+                "DSpark target-only verify_lens shape mismatch: "
+                f"expected={(bs,)}, got={tuple(verify_lens.shape)}."
+            )
+        if bool(
+            torch.any(
+                (verify_lens < 1) | (verify_lens > verify_num_draft_tokens)
+            ).item()
+        ):
+            raise ValueError(
+                "DSpark target-only verify_lens must be in "
+                f"[1, {verify_num_draft_tokens}], got={verify_lens.tolist()}."
+            )
+
+    logits_3d = target_logits.view(bs, verify_num_draft_tokens, -1)
+    correct_len = torch.empty((bs,), dtype=torch.int32, device=candidates.device)
+    bonus = torch.empty((bs,), dtype=torch.int64, device=candidates.device)
+    for verify_len_tensor in torch.unique(verify_lens):
+        verify_len = int(verify_len_tensor.item())
+        indices = torch.nonzero(verify_lens == verify_len, as_tuple=False).view(-1)
+        indices_cpu = indices.tolist()
+        group_sampling_info = sampling_info
+        if indices.numel() != bs:
+            group_sampling_info = copy.deepcopy(sampling_info)
+            group_sampling_info.filter_batch(indices_cpu, indices)
+
+        group_correct_len, group_bonus = (
+            compute_dflash_sampling_correct_drafts_and_bonus(
+                candidates=candidates.index_select(0, indices)[
+                    :, :verify_len
+                ].contiguous(),
+                next_token_logits=logits_3d.index_select(0, indices)[:, :verify_len]
+                .reshape(-1, target_logits.shape[-1])
+                .contiguous(),
+                sampling_info=group_sampling_info,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
+        )
+        correct_len.index_copy_(0, indices, group_correct_len.to(torch.int32))
+        bonus.index_copy_(0, indices, group_bonus.to(torch.int64))
+
+    return correct_len, bonus, torch.zeros_like(correct_len)
