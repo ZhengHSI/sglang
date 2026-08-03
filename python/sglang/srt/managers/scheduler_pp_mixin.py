@@ -4,7 +4,7 @@ import logging
 import math
 import time
 from array import array
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -139,6 +139,15 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
                 if self.server_args.pp_async_batch_depth == 0:
+                    if cur_batch and self.spec_algorithm.is_dspark():
+                        # Keep output relay/copy collectives ordered after this
+                        # microbatch's model work. Otherwise the schedule stream
+                        # can enter output communication while the forward
+                        # stream is still using TP/PP communicators, creating a
+                        # cross-stream collective cycle at batch depth zero.
+                        self.device_module.current_stream().wait_event(
+                            self.launch_event
+                        )
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -154,6 +163,11 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
+                    if self.spec_algorithm.is_dspark() and self.send_output_work:
+                        # Keep the prior output relay complete before the next
+                        # proxy starts. The receiver selects a tensor-dict
+                        # message only after its metadata has arrived.
+                        self._pp_commit_comm_work(self.send_output_work)
                     if cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -575,9 +589,6 @@ class SchedulerPPMixin:
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
-        self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
-            defaultdict(deque)
-        )
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -1013,7 +1024,21 @@ class SchedulerPPMixin:
             }
 
         if result.pp_verify_input_raw:
-            tensor_dict.update(result.pp_verify_input_raw.to_tensor_dict())
+            if self.spec_algorithm.is_dspark():
+                tensor_dict.update(
+                    result.pp_verify_input_raw.to_serializable_dict()
+                )
+            else:
+                tensor_dict.update(result.pp_verify_input_raw.to_tensor_dict())
+
+        if self.spec_algorithm.is_dspark():
+            # DSpark's graph epilogue and draft sampler expose views of
+            # persistent output buffers. PP sends are asynchronous, so take a
+            # per-microbatch snapshot before those buffers are reused.
+            tensor_dict = {
+                key: value.clone() if isinstance(value, torch.Tensor) else value
+                for key, value in tensor_dict.items()
+            }
 
         return tensor_dict
 
@@ -1029,14 +1054,25 @@ class SchedulerPPMixin:
                 "PP send: using default untyped message. "
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
-        tensor_dict["__msg_type__"] = msg_type
+        wire_tensor_dict = dict(tensor_dict)
+        wire_tensor_dict["__msg_type__"] = msg_type
+        pp_tensor_group = (
+            self.pp_output_group if msg_type == "output" else self.pp_group
+        )
+        # Output payloads are small, but their send-slice/all-gather would
+        # share the attention-TP communicator with model collectives on other
+        # streams. Send the complete output from every TP lane to keep this
+        # relay independent from forward/proxy collective ordering.
+        all_gather_group = (
+            self.attn_tp_group
+            if self.require_attn_tp_allgather and msg_type != "output"
+            else None
+        )
         p2p_work = []
         p2p_work.extend(
-            self.pp_group.send_tensor_dict(
-                tensor_dict=tensor_dict,
-                all_gather_group=(
-                    self.attn_tp_group if self.require_attn_tp_allgather else None
-                ),
+            pp_tensor_group.send_tensor_dict(
+                tensor_dict=wire_tensor_dict,
+                all_gather_group=all_gather_group,
                 async_send=async_send,
             )
         )
@@ -1047,33 +1083,25 @@ class SchedulerPPMixin:
         expected_kind: str = "default",
         all_gather_group: Optional = None,
     ) -> Dict[str, torch.Tensor]:
-        """Receive a typed tensor dict, demultiplexing by msg_type.
-
-        If a message of the wrong kind is received, it's stashed in the queue
-        and we continue receiving until we get the expected kind.
-        """
-        if expected_kind in self._pp_tensor_dict_inbox:
-            inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
-            if inbox_queue:
-                return inbox_queue.popleft()
-
-        while True:
-            tensor_dict = self.pp_group.recv_tensor_dict(
-                all_gather_group=all_gather_group
+        """Receive a tensor dict from the channel dedicated to its message kind."""
+        pp_tensor_group = (
+            self.pp_output_group if expected_kind == "output" else self.pp_group
+        )
+        tensor_dict = pp_tensor_group.recv_tensor_dict(
+            all_gather_group=all_gather_group
+        )
+        received_kind = tensor_dict.get("__msg_type__", "default")
+        if received_kind != expected_kind:
+            raise RuntimeError(
+                "PP tensor channel protocol mismatch: "
+                f"expected {expected_kind!r}, got {received_kind!r}"
             )
-            received_kind = tensor_dict.get("__msg_type__", "default")
-            if received_kind == expected_kind:
-                if received_kind == "default":
-                    logger.warning_once(
-                        f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
-                        "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
-                    )
-                return tensor_dict
-            else:
-                logger.debug(
-                    f"PP recv: expected {expected_kind}, got {received_kind}, stashing"
-                )
-                self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
+        if received_kind == "default":
+            logger.warning_once(
+                f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
+                "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
+            )
+        return tensor_dict
 
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
@@ -1093,9 +1121,7 @@ class SchedulerPPMixin:
     ) -> Dict[str, torch.Tensor]:
         return self._pp_recv_typed_dict(
             expected_kind="output",
-            all_gather_group=(
-                self.attn_tp_group if self.require_attn_tp_allgather else None
-            ),
+            all_gather_group=None,
         )
 
     def _pp_make_skip_output_result(
@@ -1347,16 +1373,20 @@ class SchedulerPPMixin:
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                 )
+                pp_outputs_to_send = None
+                if self.pp_group.is_last_rank:
+                    pp_outputs_to_send = PPProxyTensors(
+                        self._pp_prepare_tensor_dict(result, cur_batch)
+                    )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
+                    assert pp_outputs_to_send is not None
                     last_rank_comm_queue.append(
                         (
                             event,
-                            PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, cur_batch)
-                            ),
+                            pp_outputs_to_send,
                         )
                     )
         return result, event

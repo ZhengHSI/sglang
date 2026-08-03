@@ -403,6 +403,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 max_bs=max(server_args.cuda_graph_config.decode.bs),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
+                # PP replays a proposal relayed through DSparkPPVerifyInputRaw.
+                # Its graph-folded draft-token buffers cannot be reused safely
+                # after the pipeline round trip, so accept/finalize must run
+                # once outside the target graph. Keep only compact-to-strided
+                # scatter in the graph and avoid recording a duplicate greedy
+                # accept, TP sync, and gated commit.
+                fold_accept=not self._pp_enabled,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -909,8 +916,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         ).contiguous()
 
         proposal_or_raw_folded = proposal.folded if proposal is not None else False
+        epilogue = self._verify_executor.verify_epilogue
         fold_eligible = (
-            self._verify_executor.verify_epilogue is not None
+            epilogue is not None
+            and epilogue.folds_accept
             and proposal_or_raw_folded
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
@@ -920,6 +929,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 target_verify, hidden_strided = self._verify_executor.run_compact(
                     batch=batch,
                     layout=layout,
+                    verify_window=verify_window,
+                    verify_ids_2d=verify_ids_2d,
                     draft_block_ids=draft_block_ids,
                     draft_tokens=draft_tokens,
                     bs=bs,
@@ -958,7 +969,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 pp_verify_input_raw=None,
             )
 
-        epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,

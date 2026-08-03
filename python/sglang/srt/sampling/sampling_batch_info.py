@@ -297,7 +297,11 @@ class SamplingBatchInfo:
             logits.add_(self.logit_bias)
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
-        self.penalizer_orchestrator.filter(keep_indices_device)
+        # Forward-only copies intentionally drop the orchestrator after materializing
+        # their penalties in ``copy_for_forward``. These copies can still be split
+        # into smaller groups during speculative verification.
+        if self.penalizer_orchestrator is not None:
+            self.penalizer_orchestrator.filter(keep_indices_device)
 
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices, keep_indices_device)
@@ -308,6 +312,8 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "acc_additive_penalties",
+            "acc_scaling_penalties",
         ]:
             value = getattr(self, item, None)
             if value is not None:

@@ -400,7 +400,7 @@ def compact_row_index_triton(
 def _compact_verify_ids_gather_kernel(
     req_ptr,
     within_ptr,
-    draft_block_ids_ptr,
+    anchors_ptr,
     draft_tokens_ptr,
     out_ptr,
     bs,
@@ -415,9 +415,14 @@ def _compact_verify_ids_gather_kernel(
     within = tl.load(within_ptr + offs, mask=mask, other=0)
     valid = req < bs
     safe_req = tl.minimum(req, bs - 1)
-    anchor = tl.load(draft_block_ids_ptr + safe_req * gamma, mask=mask, other=0)
+    anchor = tl.load(anchors_ptr + safe_req, mask=mask & valid, other=0)
     wcol = tl.maximum(within - 1, 0)
-    draft = tl.load(draft_tokens_ptr + safe_req * gamma + wcol, mask=mask, other=0)
+    is_draft = valid & (within > 0) & (wcol < gamma)
+    draft = tl.load(
+        draft_tokens_ptr + safe_req * gamma + wcol,
+        mask=mask & is_draft,
+        other=0,
+    )
     v = tl.where(within == 0, anchor, draft)
     v = tl.where(valid, v, 0)
     tl.store(out_ptr + offs, v.to(tl.int64), mask=mask)
@@ -437,14 +442,16 @@ def compact_verify_ids_triton(
     )
     bs = layout.verify_lens.shape[0]
     gamma = draft_tokens.shape[1]
-    draft_block_ids = draft_block_ids.to(device=device, dtype=torch.int64).contiguous()
+    anchors = (
+        draft_block_ids[:, 0].to(device=device, dtype=torch.int64).contiguous()
+    )
     draft_tokens = draft_tokens.to(device=device, dtype=torch.int64).contiguous()
     n = layout.graph_num_tokens
     out = torch.empty(n, dtype=torch.int64, device=device)
     BLOCK = 256
     grid = (triton.cdiv(n, BLOCK),)
     _compact_verify_ids_gather_kernel[grid](
-        req, within, draft_block_ids, draft_tokens, out, bs, gamma, n, BLOCK=BLOCK
+        req, within, anchors, draft_tokens, out, bs, gamma, n, BLOCK=BLOCK
     )
     return out
 
@@ -529,6 +536,7 @@ def _scatter_compact_to_strided_kernel(
     dim,
     fill_value,
     BLOCK_D: tl.constexpr,
+    SKIP_ZERO_LENS: tl.constexpr,
 ):
     o = tl.program_id(0).to(tl.int64)
     dblk = tl.program_id(1)
@@ -542,7 +550,48 @@ def _scatter_compact_to_strided_kernel(
     src = tl.where(in_range, start_i + w, 0)
     val = tl.load(compact_ptr + src * dim + d, mask=dmask & in_range, other=0)
     val = tl.where(in_range, val, fill_value)
-    tl.store(out_ptr + o * dim + d, val, mask=dmask)
+    store_mask = dmask
+    if SKIP_ZERO_LENS:
+        store_mask = store_mask & (vl_i > 0)
+    tl.store(out_ptr + o * dim + d, val, mask=store_mask)
+
+
+def _scatter_compact_to_strided_into_torch(
+    *,
+    compact: torch.Tensor,
+    verify_lens: torch.Tensor,
+    start: torch.Tensor,
+    out: torch.Tensor,
+    stride: int,
+    fill_value: float,
+    skip_zero_lens: bool,
+) -> torch.Tensor:
+    if out.shape[0] % stride != 0:
+        raise ValueError(
+            f"strided output rows {out.shape[0]} must be divisible by stride {stride}"
+        )
+    bs = out.shape[0] // stride
+    if verify_lens.numel() < bs or start.numel() < bs:
+        raise ValueError(
+            "verify_lens/start are shorter than the strided output batch: "
+            f"verify_lens={verify_lens.numel()}, start={start.numel()}, bs={bs}"
+        )
+    for i in range(bs):
+        verify_len = int(verify_lens[i].item())
+        if not 0 <= verify_len <= stride:
+            raise ValueError(
+                f"verify_lens[{i}]={verify_len} must be in [0, {stride}]"
+            )
+        if skip_zero_lens and verify_len == 0:
+            continue
+        block = out[i * stride : (i + 1) * stride]
+        block.fill_(fill_value)
+        if verify_len:
+            compact_start = int(start[i].item())
+            block[:verify_len].copy_(
+                compact[compact_start : compact_start + verify_len]
+            )
+    return out
 
 
 def scatter_compact_to_strided_into(
@@ -552,12 +601,33 @@ def scatter_compact_to_strided_into(
     out: torch.Tensor,
     stride: int,
     fill_value: float,
+    start: torch.Tensor | None = None,
+    skip_zero_lens: bool = False,
 ) -> torch.Tensor:
+    """Scatter packed request rows into fixed-width blocks.
+
+    By default every output block is defined, including zero-length requests.
+    ``skip_zero_lens`` instead leaves those blocks untouched; callers may use
+    it only when padded blocks cannot be observed.
+    """
     dim = compact.shape[1]
     fill_value = float(fill_value) if out.dtype.is_floating_point else int(fill_value)
     compact = compact.contiguous()
     verify_lens = verify_lens.to(dtype=torch.int64).contiguous()
-    start = (torch.cumsum(verify_lens, dim=0) - verify_lens).contiguous()
+    if start is None:
+        start = (torch.cumsum(verify_lens, dim=0) - verify_lens).contiguous()
+    else:
+        start = start.to(device=verify_lens.device, dtype=torch.int64).contiguous()
+    if not compact.is_cuda:
+        return _scatter_compact_to_strided_into_torch(
+            compact=compact,
+            verify_lens=verify_lens,
+            start=start,
+            out=out,
+            stride=stride,
+            fill_value=fill_value,
+            skip_zero_lens=skip_zero_lens,
+        )
     n_out = out.shape[0]
     BLOCK_D = 1024
     grid = (n_out, triton.cdiv(dim, BLOCK_D))
@@ -570,6 +640,7 @@ def scatter_compact_to_strided_into(
         dim,
         fill_value,
         BLOCK_D=BLOCK_D,
+        SKIP_ZERO_LENS=skip_zero_lens,
     )
     return out
 

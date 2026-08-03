@@ -1,21 +1,34 @@
 import os
 import types
 import unittest
+from collections import deque
+from contextlib import nullcontext
 from unittest import mock
 
 os.environ.setdefault("FLASHINFER_WORKSPACE_BASE", "/tmp/flashinfer-test")
 
 import torch
 
-from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
+from sglang.srt.models.dspark import run_markov_block
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockResult,
+    sample_draft_block,
+    sync_dspark_tensor_across_tp,
+)
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
     DSparkVerifyPlanner,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     DSparkPPVerifyInputRaw,
+    DsparkVerifyEpilogue,
     TargetVerifyExecutor,
     TargetVerifyResult,
+    _sync_accept_across_tp,
     accept_draft_tokens,
 )
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
@@ -27,6 +40,9 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
 )
 from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
     sample_step_tokens,
+)
+from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
+    scatter_compact_to_strided_into,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
 from sglang.srt.speculative.spec_info import SpecInputType
@@ -68,7 +84,228 @@ def _raw(start: int = 0, count: int = 3) -> DSparkPPVerifyInputRaw:
     )
 
 
+class TestSchedulerPPOutputSnapshot(CustomTestCase):
+    def setUp(self):
+        self.scheduler = SchedulerPPMixin()
+        self.scheduler.pp_group = mock.Mock()
+        self.scheduler.pp_output_group = mock.Mock()
+
+    def test_tensor_message_kinds_use_distinct_pp_channels(self):
+        self.scheduler.attn_tp_group = mock.sentinel.attn_tp_group
+        self.scheduler.require_attn_tp_allgather = True
+        self.scheduler.pp_group.send_tensor_dict.return_value = [
+            mock.sentinel.proxy_work
+        ]
+        self.scheduler.pp_output_group.send_tensor_dict.return_value = [
+            mock.sentinel.output_work
+        ]
+        proxy_payload = {"hidden_states": torch.tensor([1.0])}
+        output_payload = {"next_token_ids": torch.tensor([2])}
+
+        proxy_work = self.scheduler._pp_send_dict_to_next_stage(
+            proxy_payload,
+            msg_type="proxy",
+        )
+        output_work = self.scheduler._pp_send_dict_to_next_stage(
+            output_payload,
+            msg_type="output",
+        )
+
+        self.assertEqual(proxy_work, [mock.sentinel.proxy_work])
+        self.assertEqual(output_work, [mock.sentinel.output_work])
+        self.assertNotIn("__msg_type__", proxy_payload)
+        self.assertNotIn("__msg_type__", output_payload)
+        self.scheduler.pp_group.send_tensor_dict.assert_called_once()
+        self.scheduler.pp_output_group.send_tensor_dict.assert_called_once()
+        proxy_kwargs = self.scheduler.pp_group.send_tensor_dict.call_args.kwargs
+        output_kwargs = (
+            self.scheduler.pp_output_group.send_tensor_dict.call_args.kwargs
+        )
+        self.assertEqual(proxy_kwargs["tensor_dict"]["__msg_type__"], "proxy")
+        self.assertEqual(output_kwargs["tensor_dict"]["__msg_type__"], "output")
+        self.assertIs(
+            proxy_kwargs["all_gather_group"], mock.sentinel.attn_tp_group
+        )
+        self.assertIsNone(output_kwargs["all_gather_group"])
+
+    def test_tensor_message_kinds_receive_from_distinct_pp_channels(self):
+        self.scheduler.pp_group.recv_tensor_dict.return_value = {
+            "__msg_type__": "proxy",
+            "hidden_states": torch.tensor([1.0]),
+        }
+        self.scheduler.pp_output_group.recv_tensor_dict.return_value = {
+            "__msg_type__": "output",
+            "next_token_ids": torch.tensor([2]),
+        }
+
+        proxy_payload = self.scheduler._pp_recv_typed_dict(
+            expected_kind="proxy",
+            all_gather_group=mock.sentinel.attn_tp_group,
+        )
+        output_payload = self.scheduler._pp_recv_typed_dict(
+            expected_kind="output",
+            all_gather_group=mock.sentinel.attn_tp_group,
+        )
+
+        self.assertEqual(proxy_payload["__msg_type__"], "proxy")
+        self.assertEqual(output_payload["__msg_type__"], "output")
+        self.scheduler.pp_group.recv_tensor_dict.assert_called_once_with(
+            all_gather_group=mock.sentinel.attn_tp_group
+        )
+        self.scheduler.pp_output_group.recv_tensor_dict.assert_called_once_with(
+            all_gather_group=mock.sentinel.attn_tp_group
+        )
+
+    def test_output_relay_disables_attn_tp_all_gather(self):
+        self.scheduler.require_attn_tp_allgather = True
+        self.scheduler.attn_tp_group = mock.sentinel.attn_tp_group
+        self.scheduler.pp_output_group.recv_tensor_dict.return_value = {
+            "__msg_type__": "output",
+            "next_token_ids": torch.tensor([2]),
+        }
+
+        payload = self.scheduler._pp_recv_dict_from_prev_stage()
+
+        self.assertEqual(payload["__msg_type__"], "output")
+        self.scheduler.pp_output_group.recv_tensor_dict.assert_called_once_with(
+            all_gather_group=None
+        )
+
+    def test_tensor_channel_kind_mismatch_fails_fast(self):
+        self.scheduler.pp_output_group.recv_tensor_dict.return_value = {
+            "__msg_type__": "proxy",
+            "next_token_ids": torch.tensor([2]),
+        }
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "expected 'output', got 'proxy'",
+        ):
+            self.scheduler._pp_recv_typed_dict(expected_kind="output")
+
+    def test_launch_records_ready_event_after_output_snapshot(self):
+        call_order = []
+        event = mock.Mock()
+        event.record.side_effect = lambda stream: call_order.append("record")
+        self.scheduler.device_module = types.SimpleNamespace(
+            Event=lambda: event,
+            current_stream=lambda: mock.sentinel.current_stream,
+        )
+        self.scheduler.forward_stream_ctx = nullcontext()
+        self.scheduler.forward_stream = mock.Mock()
+        self.scheduler.schedule_stream = mock.sentinel.schedule_stream
+        self.scheduler.pp_group.is_last_rank = True
+        self.scheduler.run_batch = mock.Mock(
+            return_value=types.SimpleNamespace(can_run_cuda_graph=False)
+        )
+        self.scheduler._pp_prepare_tensor_dict = mock.Mock(
+            side_effect=lambda result, batch: (
+                call_order.append("snapshot") or {"output": torch.tensor([1])}
+            )
+        )
+        mb_metadata = [None]
+        last_rank_comm_queue = deque()
+
+        self.scheduler._pp_launch_batch(
+            0,
+            types.SimpleNamespace(reqs=[]),
+            pp_proxy_tensors=None,
+            mb_metadata=mb_metadata,
+            last_rank_comm_queue=last_rank_comm_queue,
+        )
+
+        self.assertEqual(call_order, ["snapshot", "record"])
+        self.assertEqual(len(last_rank_comm_queue), 1)
+
+    def test_prepare_snapshots_all_dspark_output_tensors(self):
+        self.scheduler.spec_algorithm = types.SimpleNamespace(
+            is_dspark=lambda: True
+        )
+        next_token_ids = torch.tensor([11, 12])
+        raw_payload = {
+            "dspark_pp_spec_version": 2,
+            "dspark_pp_bonus_tokens": torch.tensor([21, 22]),
+            "dspark_pp_draft_tokens": torch.tensor([[31, 32], [33, 34]]),
+            "dspark_pp_new_seq_lens": torch.tensor([41, 42]),
+            "dspark_pp_accept_lens": torch.tensor([1, 2], dtype=torch.int32),
+            "dspark_pp_confidence": torch.tensor([[0.1, 0.2], [0.3, 0.4]]),
+            "dspark_pp_cap_trim_lens": torch.tensor([0, 1], dtype=torch.int32),
+            "dspark_pp_verify_lens": torch.tensor([3, 3]),
+            "dspark_pp_next_verify_lens": torch.tensor([2, 3]),
+            "dspark_pp_draft_logits_cache_ids": torch.tensor([7, 7]),
+            "dspark_pp_draft_logits_cache_rows": torch.tensor([0, 1]),
+            "dspark_pp_max_top_k": 32,
+        }
+        source_tensors = {
+            "next_token_ids": next_token_ids,
+            **{
+                key: value
+                for key, value in raw_payload.items()
+                if isinstance(value, torch.Tensor)
+            },
+        }
+        expected = {key: value.clone() for key, value in source_tensors.items()}
+
+        payload = self.scheduler._pp_prepare_tensor_dict(
+            types.SimpleNamespace(
+                next_token_ids=next_token_ids,
+                pp_verify_input_raw=types.SimpleNamespace(
+                    to_serializable_dict=lambda: raw_payload
+                ),
+            ),
+            types.SimpleNamespace(return_logprob=False),
+        )
+
+        for key, source in source_tensors.items():
+            self.assertNotEqual(payload[key].data_ptr(), source.data_ptr())
+            source.fill_(-1)
+            torch.testing.assert_close(payload[key], expected[key])
+        self.assertEqual(payload["dspark_pp_spec_version"], 2)
+        self.assertEqual(payload["dspark_pp_max_top_k"], 32)
+
+    def test_prepare_uses_single_metadata_object_for_dspark_raw(self):
+        self.scheduler.spec_algorithm = types.SimpleNamespace(
+            is_dspark=lambda: True
+        )
+        next_token_ids = torch.tensor([11, 12])
+
+        payload = self.scheduler._pp_prepare_tensor_dict(
+            types.SimpleNamespace(
+                next_token_ids=next_token_ids,
+                pp_verify_input_raw=_raw(count=2),
+            ),
+            types.SimpleNamespace(return_logprob=False),
+        )
+
+        self.assertEqual(set(payload), {"next_token_ids", "pp_spec_output"})
+        self.assertNotEqual(
+            payload["next_token_ids"].data_ptr(),
+            next_token_ids.data_ptr(),
+        )
+        self.assertEqual(
+            payload["pp_spec_output"]["draft_tokens"],
+            [[0, 1], [1, 2]],
+        )
+
+
 class TestDSparkPPVerifyInputRaw(CustomTestCase):
+    def test_serializable_round_trip_uses_single_metadata_object(self):
+        payload = _raw().to_serializable_dict()
+        restored = DSparkPPVerifyInputRaw.from_pp_outputs(
+            types.SimpleNamespace(tensors=payload)
+        )
+
+        self.assertEqual(list(payload), ["pp_spec_output"])
+        self.assertFalse(
+            any(
+                torch.is_tensor(value)
+                for value in payload["pp_spec_output"].values()
+            )
+        )
+        self.assertEqual(restored.bonus_tokens, [100, 101, 102])
+        self.assertEqual(restored.draft_tokens, [[0, 1], [1, 2], [2, 3]])
+        self.assertEqual(restored.next_verify_lens, [2, 3, 2])
+
     def test_round_trip_uses_top_level_tensors(self):
         payload = _raw().to_tensor_dict()
         restored = DSparkPPVerifyInputRaw.from_pp_outputs(
@@ -146,6 +383,85 @@ class TestDSparkPPVerifyInputRaw(CustomTestCase):
         torch.testing.assert_close(raw.draft_tokens, torch.tensor([[11] * 5, [22] * 5]))
         torch.testing.assert_close(raw.confidence, torch.zeros((2, 5)))
         torch.testing.assert_close(raw.next_verify_lens, torch.tensor([6, 6]))
+
+
+class TestDSparkPPBatchResultProcessor(CustomTestCase):
+    @unittest.skipUnless(
+        torch.cuda.is_available(),
+        "requires CUDA for PP accept-lens device regression",
+    )
+    def test_cuda_accept_lens_keeps_seq_lens_cpu_on_cpu(self):
+        metrics = types.SimpleNamespace(
+            num_generated_tokens=0,
+            forward_ct_decode=0,
+            update_spec_metrics=mock.Mock(),
+            report_decode_stats=mock.Mock(),
+        )
+        processor = SchedulerBatchResultProcessor(
+            is_generation=True,
+            disaggregation_mode=None,
+            enable_overlap=True,
+            enable_overlap_mlx=False,
+            server_args=types.SimpleNamespace(enable_metrics=False),
+            model_config=types.SimpleNamespace(think_end_id=None),
+            token_to_kv_pool_allocator=types.SimpleNamespace(
+                free_group_begin=mock.Mock(),
+                free_group_end=mock.Mock(),
+            ),
+            tree_cache=None,
+            hisparse_coordinator=None,
+            req_to_token_pool=None,
+            decode_offload_manager=None,
+            metrics_collector=None,
+            metrics_reporter=metrics,
+            draft_worker=None,
+            model_worker=mock.Mock(),
+            logprob_result_processor=None,
+            output_streamer=types.SimpleNamespace(stream_output=mock.Mock()),
+            abort_request=mock.Mock(),
+        )
+        raw = DSparkPPVerifyInputRaw.from_pp_outputs(
+            types.SimpleNamespace(
+                tensors=_raw(start=1, count=1).to_tensor_dict(device="cuda")
+            )
+        )
+        self.assertEqual(raw.accept_lens.device.type, "cuda")
+        req = types.SimpleNamespace(finished=lambda: True, is_retracted=False)
+        batch = types.SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            spec_algorithm=types.SimpleNamespace(is_none=lambda: False),
+            spec_info=raw,
+            seq_lens=torch.tensor([10], dtype=torch.int64, device="cuda"),
+            seq_lens_cpu=torch.tensor([10], dtype=torch.int64),
+            seq_lens_sum=10,
+            batch_size=lambda: 1,
+        )
+        result = types.SimpleNamespace(
+            copy_done=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=None,
+            next_token_ids=None,
+            can_run_cuda_graph=False,
+            accept_lens=torch.tensor([2], dtype=torch.int32),
+            num_correct_drafts=0,
+            num_block_accept_tokens=0,
+            num_cap_tokens=0,
+        )
+
+        with mock.patch.object(
+            SchedulerBatchResultProcessor,
+            "_normalize_decode_outputs",
+            return_value=([[]], None),
+        ):
+            processor.process_batch_result_decode(batch, result)
+
+        self.assertEqual(batch.seq_lens_cpu.device.type, "cpu")
+        torch.testing.assert_close(batch.seq_lens_cpu, torch.tensor([12]))
+        torch.testing.assert_close(
+            batch.seq_lens, torch.tensor([12], device="cuda")
+        )
 
 
 class TestPPDraftLogitsCache(CustomTestCase):
@@ -248,6 +564,935 @@ class TestPPDraftLogitsCache(CustomTestCase):
 
         torch.testing.assert_close(draft_block.corrected_logits, logits)
         torch.testing.assert_close(restored_tokens, tokens)
+
+
+class TestDSparkWorkerPPCompactWiring(CustomTestCase):
+    def test_pp_raw_compact_accepts_once_outside_graph(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.device = torch.device("cpu")
+        worker.verify_num_draft_tokens = 3
+        worker._block_pos_offsets = object()
+        worker.model_runner = object()
+        worker._target_worker = types.SimpleNamespace(
+            model_runner=types.SimpleNamespace(model=object())
+        )
+        worker.server_args = types.SimpleNamespace(enable_dp_attention=False)
+        worker._draft_is_moe = False
+        worker._pp_enabled = True
+        worker._pp_is_last_rank = True
+        worker._simulate_acc_len = 0
+
+        seq_lens = mock.MagicMock()
+        seq_lens.__len__.return_value = 1
+        sampling_info = types.SimpleNamespace(is_all_greedy=True)
+        batch = types.SimpleNamespace(
+            spec_info=_raw(count=1),
+            forward_mode=types.SimpleNamespace(is_idle=lambda: False),
+            seq_lens=seq_lens,
+            sampling_info=sampling_info,
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            global_num_tokens=None,
+            forward_iter=1,
+            reqs=[object()],
+            spec_verify_tier_num_tokens=2,
+        )
+
+        draft_tokens = torch.tensor([[20, 30]], dtype=torch.int64)
+        draft_block = DraftBlockResult(
+            draft_tokens=draft_tokens,
+            corrected_logits=torch.zeros((1, 2, 4)),
+            greedy_mask=torch.ones(1, dtype=torch.bool),
+            temperatures=torch.ones(1),
+        )
+        confidence = torch.ones((1, 2))
+        worker._draft_block_from_pp_raw = mock.Mock(
+            return_value=(
+                torch.tensor([[10]], dtype=torch.int64),
+                draft_block,
+                draft_tokens,
+                confidence,
+            )
+        )
+
+        layout = types.SimpleNamespace(
+            verify_lens=torch.tensor([2], dtype=torch.int32),
+            verify_lens_cpu=[2],
+        )
+        worker._verify_planner = types.SimpleNamespace(
+            is_static_mode=False,
+            verify_budget_from_lens=mock.Mock(return_value=1),
+            layout_from_relayed_verify_lens=mock.Mock(return_value=layout),
+            should_run_compact=mock.Mock(return_value=True),
+            compute_budget_sync=mock.Mock(return_value=1),
+            schedule_layout=mock.Mock(return_value=layout),
+            verify_lens_for_pp_relay=mock.Mock(return_value=[2]),
+        )
+
+        logits_output = types.SimpleNamespace(
+            next_token_logits=torch.zeros((2, 4)),
+            hidden_states=torch.zeros((2, 2)),
+        )
+        target_verify = TargetVerifyResult(
+            logits_output=logits_output,
+            can_run_cuda_graph=True,
+        )
+        accept = types.SimpleNamespace(
+            correct_len=torch.tensor([1], dtype=torch.int32),
+            bonus=torch.tensor([99], dtype=torch.int64),
+            cap_trim_lens=torch.tensor([0], dtype=torch.int32),
+            commit_lens=torch.tensor([2], dtype=torch.int32),
+            new_seq_lens=torch.tensor([7], dtype=torch.int64),
+            out_tokens=torch.tensor([[20, 99, 0]], dtype=torch.int64),
+        )
+        # Even if a future epilogue advertises folded accept, PP raw proposals
+        # must never arm it: their graph-owned proposal buffers did not survive
+        # the pipeline round trip.
+        epilogue = types.SimpleNamespace(folds_accept=True, folds_commit=True)
+        worker._verify_executor = types.SimpleNamespace(
+            verify_epilogue=epilogue,
+            run_compact=mock.Mock(
+                return_value=(target_verify, torch.zeros((3, 2)))
+            ),
+            accept_and_finalize=mock.Mock(return_value=accept),
+            commit_hidden=mock.Mock(),
+        )
+
+        proposal_next = types.SimpleNamespace(
+            confidence=confidence,
+            draft_hidden=None,
+            draft_block_ids=torch.tensor([[99]], dtype=torch.int64),
+            draft_block=draft_block,
+            confidence_tap=None,
+        )
+        worker._proposer = types.SimpleNamespace(
+            propose=mock.Mock(return_value=proposal_next)
+        )
+        worker._draft_context = mock.Mock(return_value=nullcontext())
+        worker._cache_pp_draft_logits = mock.Mock(return_value=(None, None))
+        worker._dp_verify_tier_num_tokens = mock.Mock(return_value=None)
+        worker._observers = mock.MagicMock()
+        worker._observers.segment.side_effect = lambda _: nullcontext()
+
+        next_draft_input = types.SimpleNamespace()
+        verify_window = object()
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2."
+            "alloc_verify_window",
+            return_value=verify_window,
+        ), mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2."
+            "make_next_draft_input",
+            return_value=next_draft_input,
+        ), mock.patch.object(
+            torch,
+            "get_device_module",
+            return_value=types.SimpleNamespace(
+                current_stream=lambda: mock.sentinel.stream
+            ),
+        ):
+            result = worker._forward_decode(batch, on_publish=None)
+
+        self.assertIsNotNone(result.pp_verify_input_raw)
+        compact_call = worker._verify_executor.run_compact.call_args.kwargs
+        self.assertFalse(compact_call["inject_gate"])
+        self.assertIs(compact_call["verify_window"], verify_window)
+        torch.testing.assert_close(
+            compact_call["verify_ids_2d"],
+            torch.tensor([[10, 20, 30]], dtype=torch.int64),
+        )
+        self.assertTrue(compact_call["verify_ids_2d"].is_contiguous())
+        worker._verify_executor.accept_and_finalize.assert_called_once()
+        accept_call = (
+            worker._verify_executor.accept_and_finalize.call_args.kwargs
+        )
+        self.assertFalse(accept_call["folded_accept"])
+        worker._verify_executor.commit_hidden.assert_called_once()
+
+
+class TestDSparkTPSamplingSync(CustomTestCase):
+    class _FakeTPGroup:
+        world_size = 2
+
+        def __init__(self, authoritative_values):
+            self.authoritative_values = list(authoritative_values)
+            self.broadcast_count = 0
+            self.broadcast_shapes = []
+
+        def broadcast(self, tensor, src=0):
+            if src != 0:
+                raise AssertionError(f"expected local TP source 0, got {src}")
+            self.broadcast_shapes.append(tuple(tensor.shape))
+            value = self.authoritative_values[self.broadcast_count]
+            tensor.copy_(torch.as_tensor(value, dtype=tensor.dtype).view_as(tensor))
+            self.broadcast_count += 1
+            return tensor
+
+    class _FakeMarkovHead:
+        def __init__(self):
+            self.prev_tokens = []
+
+        def apply_step_logits(self, logits, *, token_ids, hidden_states):
+            del hidden_states
+            self.prev_tokens.append(token_ids.clone())
+            return logits
+
+        def sample_block(
+            self,
+            base_logits,
+            *,
+            first_prev_tokens,
+            hidden_states,
+            sampler,
+        ):
+            return run_markov_block(
+                self,
+                base_logits,
+                first_prev_tokens=first_prev_tokens,
+                hidden_states=hidden_states,
+                sampler=sampler,
+            )
+
+    def test_eager_sync_uses_group_broadcast_with_contiguous_input(self):
+        tp_group = types.SimpleNamespace(
+            world_size=2,
+            pynccl_comm=mock.Mock(),
+            broadcast=mock.Mock(),
+        )
+        non_contiguous = torch.arange(6).view(2, 3).t()
+        self.assertFalse(non_contiguous.is_contiguous())
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.get_tp_group",
+            return_value=tp_group,
+        ), mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft."
+            "torch.cuda.is_current_stream_capturing",
+            return_value=False,
+        ):
+            result = sync_dspark_tensor_across_tp(non_contiguous)
+
+        self.assertTrue(result.is_contiguous())
+        tp_group.broadcast.assert_called_once_with(result, src=0)
+        tp_group.pynccl_comm.broadcast.assert_not_called()
+
+    def test_cuda_graph_sync_uses_pynccl_with_contiguous_input(self):
+        contiguous = mock.Mock()
+        contiguous.device = types.SimpleNamespace(type="cuda")
+        tensor = mock.Mock()
+        tensor.device = types.SimpleNamespace(type="cuda")
+        tensor.contiguous.return_value = contiguous
+        pynccl_comm = mock.Mock()
+        pynccl_comm.change_state.return_value = nullcontext()
+        tp_group = types.SimpleNamespace(
+            world_size=2,
+            pynccl_comm=pynccl_comm,
+            broadcast=mock.Mock(),
+        )
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.get_tp_group",
+            return_value=tp_group,
+        ), mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft."
+            "torch.cuda.is_current_stream_capturing",
+            return_value=True,
+        ):
+            result = sync_dspark_tensor_across_tp(tensor)
+
+        self.assertIs(result, contiguous)
+        tensor.contiguous.assert_called_once_with()
+        pynccl_comm.change_state.assert_called_once_with(enable=True)
+        pynccl_comm.broadcast.assert_called_once_with(contiguous, src=0)
+        tp_group.broadcast.assert_not_called()
+
+    def test_cuda_graph_sync_requires_pynccl(self):
+        tensor = mock.Mock()
+        tensor.device = types.SimpleNamespace(type="cuda")
+        tensor.contiguous.return_value = tensor
+        tp_group = types.SimpleNamespace(
+            world_size=2,
+            pynccl_comm=None,
+            broadcast=mock.Mock(),
+        )
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.get_tp_group",
+            return_value=tp_group,
+        ), mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft."
+            "torch.cuda.is_current_stream_capturing",
+            return_value=True,
+        ), self.assertRaisesRegex(
+            RuntimeError,
+            "requires PyNCCL during CUDA graph capture",
+        ):
+            sync_dspark_tensor_across_tp(tensor)
+
+        tp_group.broadcast.assert_not_called()
+
+    def test_non_greedy_draft_broadcasts_every_markov_step(self):
+        tp_group = self._FakeTPGroup(([2], [3], [1]))
+        markov_head = self._FakeMarkovHead()
+        sampling_info = types.SimpleNamespace(
+            is_all_greedy=False,
+            need_top_k_sampling=False,
+            need_top_p_sampling=False,
+            need_min_p_sampling=False,
+            temperatures=torch.ones(1),
+            top_ks=torch.tensor([2], dtype=torch.int32),
+        )
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.get_tp_group",
+            return_value=tp_group,
+        ), mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft."
+            "envs.SGLANG_DSPARK_FAST_SAMPLING.get",
+            return_value=True,
+        ), mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft."
+            "SampleStepTokens.execute",
+            side_effect=lambda **_: torch.tensor([0], dtype=torch.int64),
+        ):
+            result = sample_draft_block(
+                base_logits=torch.zeros((1, 3, 4)),
+                anchor_tokens=torch.tensor([0]),
+                draft_hidden=torch.zeros((1, 3, 2)),
+                sampling_info=sampling_info,
+                markov_head=markov_head,
+                device=torch.device("cpu"),
+            )
+
+        self.assertEqual(tp_group.broadcast_count, 3)
+        torch.testing.assert_close(
+            result.draft_tokens,
+            torch.tensor([[2, 3, 1]]),
+        )
+        self.assertEqual(
+            [tokens.tolist() for tokens in markov_head.prev_tokens],
+            [[0], [2], [3]],
+        )
+
+    def test_eager_accept_syncs_before_finalize(self):
+        tp_group = self._FakeTPGroup(
+            (
+                [
+                    [1],
+                    [99],
+                    [2],
+                ],
+            )
+        )
+        executor = object.__new__(TargetVerifyExecutor)
+        executor.gamma = 2
+        executor.verify_num_draft_tokens = 3
+        executor.verify_epilogue = None
+        executor._simulate_acc_len = 0
+        local_accept = (
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([7], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int32),
+        )
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.get_tp_group",
+            return_value=tp_group,
+        ), mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify."
+            "accept_draft_tokens",
+            return_value=local_accept,
+        ):
+            result = executor.accept_and_finalize(
+                folded_accept=False,
+                bs=1,
+                verify_ids_2d=torch.tensor([[10, 20, 30]]),
+                target_logits=torch.zeros((3, 4)),
+                draft_block=DraftBlockResult(
+                    draft_tokens=torch.tensor([[20, 30]]),
+                    corrected_logits=torch.zeros((1, 2, 4)),
+                    greedy_mask=torch.zeros(1, dtype=torch.bool),
+                    temperatures=torch.ones(1),
+                ),
+                sampling_info=types.SimpleNamespace(is_all_greedy=True),
+                draft_input=object(),
+                layout=None,
+                prefix_lens=torch.tensor([5]),
+                draft_tokens=torch.tensor([[20, 30]]),
+            )
+
+        self.assertEqual(tp_group.broadcast_count, 1)
+        torch.testing.assert_close(
+            result.correct_len,
+            torch.tensor([1], dtype=torch.int32),
+        )
+        torch.testing.assert_close(result.bonus, torch.tensor([99]))
+        torch.testing.assert_close(
+            result.cap_trim_lens,
+            torch.tensor([2], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            result.commit_lens,
+            torch.tensor([2], dtype=torch.int32),
+        )
+        torch.testing.assert_close(result.new_seq_lens, torch.tensor([7]))
+        torch.testing.assert_close(
+            result.out_tokens,
+            torch.tensor([[20, 99, 0]]),
+        )
+
+    def test_persistent_accept_sync_broadcasts_fixed_contiguous_block(self):
+        tp_group = self._FakeTPGroup(
+            (
+                [
+                    [1, 2, 0, 0],
+                    [99, 98, 0, 0],
+                    [2, 1, 0, 0],
+                ],
+            )
+        )
+        packed_buf = torch.zeros((3, 4), dtype=torch.int64)
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.get_tp_group",
+            return_value=tp_group,
+        ):
+            correct_len, bonus, cap_trim_lens = _sync_accept_across_tp(
+                torch.tensor([0, 0], dtype=torch.int32),
+                torch.tensor([7, 8], dtype=torch.int64),
+                torch.tensor([0, 0], dtype=torch.int32),
+                packed_buf=packed_buf,
+            )
+
+        self.assertTrue(packed_buf.is_contiguous())
+        self.assertEqual(tp_group.broadcast_shapes, [(3, 4)])
+        torch.testing.assert_close(
+            correct_len,
+            torch.tensor([1, 2], dtype=torch.int32),
+        )
+        torch.testing.assert_close(bonus, torch.tensor([99, 98]))
+        torch.testing.assert_close(
+            cap_trim_lens,
+            torch.tensor([2, 1], dtype=torch.int32),
+        )
+
+    def test_greedy_draft_broadcasts_every_markov_step(self):
+        tp_group = self._FakeTPGroup(([1], [0]))
+        markov_head = self._FakeMarkovHead()
+        base_logits = torch.tensor([[[0.0, 1.0], [2.0, 1.0]]])
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.get_tp_group",
+            return_value=tp_group,
+        ):
+            result = sample_draft_block(
+                base_logits=base_logits,
+                anchor_tokens=torch.tensor([0]),
+                draft_hidden=torch.zeros((1, 2, 2)),
+                sampling_info=None,
+                markov_head=markov_head,
+                device=torch.device("cpu"),
+            )
+
+        self.assertEqual(tp_group.broadcast_count, 2)
+        self.assertEqual(
+            [tokens.tolist() for tokens in markov_head.prev_tokens],
+            [[0], [1]],
+        )
+        torch.testing.assert_close(
+            result.draft_tokens,
+            torch.tensor([[1, 0]]),
+        )
+
+    def test_scatter_into_skip_zero_lens_preserves_inactive_blocks(self):
+        compact = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        verify_lens = torch.tensor([2, 0, 1], dtype=torch.int64)
+        start = torch.tensor([0, 2, 2], dtype=torch.int64)
+        out = torch.full((9, 2), -7.0)
+
+        result = scatter_compact_to_strided_into(
+            compact=compact,
+            verify_lens=verify_lens,
+            out=out,
+            stride=3,
+            fill_value=0.0,
+            start=start,
+            skip_zero_lens=True,
+        )
+
+        self.assertIs(result, out)
+        torch.testing.assert_close(
+            out,
+            torch.tensor(
+                [
+                    [1.0, 2.0],
+                    [3.0, 4.0],
+                    [0.0, 0.0],
+                    [-7.0, -7.0],
+                    [-7.0, -7.0],
+                    [-7.0, -7.0],
+                    [5.0, 6.0],
+                    [0.0, 0.0],
+                    [0.0, 0.0],
+                ]
+            ),
+        )
+
+        default_out = torch.full((9, 2), -7.0)
+        scatter_compact_to_strided_into(
+            compact=compact,
+            verify_lens=verify_lens,
+            out=default_out,
+            stride=3,
+            fill_value=0.0,
+        )
+        torch.testing.assert_close(default_out[3:6], torch.zeros((3, 2)))
+
+    def test_pp_scatter_shares_start_and_skips_zero_lens(self):
+        epilogue = DsparkVerifyEpilogue(
+            max_bs=2,
+            verify_num_draft_tokens=3,
+            device=torch.device("cpu"),
+            fold_accept=False,
+        )
+        epilogue.strided_logits = torch.empty((6, 4))
+        epilogue.strided_hidden = torch.empty((6, 2))
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify."
+            "scatter_compact_to_strided_into"
+        ) as scatter:
+            epilogue._scatter(
+                compact_logits=torch.zeros((2, 4)),
+                compact_hidden=torch.zeros((2, 2)),
+                verify_lens=torch.tensor([2, 0], dtype=torch.int32),
+                bs=2,
+            )
+
+        self.assertEqual(scatter.call_count, 2)
+        logits_call, hidden_call = scatter.call_args_list
+        self.assertTrue(logits_call.kwargs["skip_zero_lens"])
+        self.assertTrue(hidden_call.kwargs["skip_zero_lens"])
+        self.assertIs(logits_call.kwargs["start"], hidden_call.kwargs["start"])
+        torch.testing.assert_close(
+            logits_call.kwargs["start"],
+            torch.tensor([0, 2], dtype=torch.int64),
+        )
+
+        folded_epilogue = DsparkVerifyEpilogue(
+            max_bs=2,
+            verify_num_draft_tokens=3,
+            device=torch.device("cpu"),
+            fold_accept=True,
+        )
+        folded_epilogue.strided_logits = torch.empty((6, 4))
+        folded_epilogue.strided_hidden = torch.empty((6, 2))
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify."
+            "scatter_compact_to_strided_into"
+        ) as folded_scatter:
+            folded_epilogue._scatter(
+                compact_logits=torch.zeros((2, 4)),
+                compact_hidden=torch.zeros((2, 2)),
+                verify_lens=torch.tensor([2, 0], dtype=torch.int32),
+                bs=2,
+            )
+        self.assertTrue(
+            all(
+                not call.kwargs["skip_zero_lens"]
+                for call in folded_scatter.call_args_list
+            )
+        )
+
+    def test_epilogue_begin_step_clears_inactive_tail(self):
+        epilogue = DsparkVerifyEpilogue(
+            max_bs=4,
+            verify_num_draft_tokens=3,
+            device=torch.device("cpu"),
+            fold_accept=False,
+        )
+        epilogue.begin_step(torch.tensor([3, 2, 1]), armed=True)
+        epilogue.begin_step(torch.tensor([2]), armed=False)
+
+        torch.testing.assert_close(
+            epilogue.verify_lens_buf,
+            torch.tensor([2, 0, 0, 0], dtype=torch.int64),
+        )
+        torch.testing.assert_close(
+            epilogue.inject_gate_buf,
+            torch.tensor([0], dtype=torch.int32),
+        )
+
+    def test_folded_greedy_epilogue_syncs_before_finalize(self):
+        tp_group = self._FakeTPGroup(
+            (
+                [
+                    [1],
+                    [99],
+                    [0],
+                ],
+            )
+        )
+        epilogue = DsparkVerifyEpilogue(
+            max_bs=1,
+            verify_num_draft_tokens=3,
+            device=torch.device("cpu"),
+        )
+        epilogue.strided_logits = torch.zeros((3, 4))
+        epilogue.draft_tokens_buf[:2].copy_(torch.tensor([20, 30]))
+        local_accept = (
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([7], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int32),
+        )
+        finalized = types.SimpleNamespace(
+            commit_lens=torch.tensor([2], dtype=torch.int32),
+            new_seq_lens=torch.tensor([7], dtype=torch.int64),
+        )
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.get_tp_group",
+            return_value=tp_group,
+        ), mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify."
+            "scatter_compact_to_strided_into",
+        ), mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify."
+            "accept_greedy_triton",
+            return_value=local_accept,
+        ), mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify."
+            "finalize_accept_lens_triton",
+            return_value=finalized,
+        ), mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify."
+            "BuildOutTokens.execute",
+            return_value=torch.tensor([[20, 99, 0]]),
+        ):
+            commit_lens = epilogue._accept(
+                input_ids=torch.tensor([10, 20, 30]),
+                seq_lens=torch.tensor([5]),
+                verify_lens=torch.tensor([3]),
+                bs=1,
+            )
+
+        self.assertEqual(tp_group.broadcast_count, 1)
+        torch.testing.assert_close(
+            commit_lens,
+            torch.tensor([2], dtype=torch.int32),
+        )
+        torch.testing.assert_close(epilogue.correct_len_buf[:1], torch.tensor([1]))
+        torch.testing.assert_close(epilogue.bonus_buf[:1], torch.tensor([99]))
+        torch.testing.assert_close(
+            epilogue.commit_lens_buf[:1],
+            torch.tensor([2], dtype=torch.int32),
+        )
+        torch.testing.assert_close(epilogue.new_seq_lens_buf[:1], torch.tensor([7]))
+        torch.testing.assert_close(
+            epilogue.out_tokens_buf[:1],
+            torch.tensor([[20, 99, 0]]),
+        )
+
+    def test_pp_epilogue_records_scatter_without_duplicate_accept(self):
+        fused_pool = types.SimpleNamespace(
+            set_swa_key_buffer_radix_fused_norm_rope=mock.Mock()
+        )
+        epilogue = DsparkVerifyEpilogue(
+            max_bs=1,
+            verify_num_draft_tokens=3,
+            device=torch.device("cpu"),
+            fold_accept=False,
+            commit_ctx=types.SimpleNamespace(resolve_pool=lambda: fused_pool),
+        )
+        epilogue.strided_logits = torch.empty((3, 4))
+        epilogue.strided_hidden = torch.empty((3, 2))
+        epilogue._scatter = mock.Mock()
+        epilogue._accept = mock.Mock()
+        epilogue._commit_inject = mock.Mock()
+
+        epilogue(
+            compact_logits=torch.zeros((3, 4)),
+            compact_hidden=torch.zeros((3, 2)),
+            input_ids=torch.tensor([10, 20, 30]),
+            seq_lens=torch.tensor([5]),
+            req_pool_indices=torch.tensor([0]),
+            bs=1,
+        )
+
+        self.assertFalse(epilogue.folds_accept)
+        self.assertFalse(epilogue.folds_commit)
+        epilogue._scatter.assert_called_once()
+        epilogue._accept.assert_not_called()
+        epilogue._commit_inject.assert_not_called()
+
+
+class TestTargetVerifyExecutorFullWidthWindow(CustomTestCase):
+    @staticmethod
+    def _executor():
+        executor = object.__new__(TargetVerifyExecutor)
+        executor.verify_num_draft_tokens = 3
+        executor.model_runner = object()
+        executor.verify_epilogue = None
+        executor._run_ragged = mock.Mock(
+            return_value=TargetVerifyResult(
+                logits_output=None,
+                can_run_cuda_graph=False,
+            )
+        )
+        return executor
+
+    @staticmethod
+    def _inputs():
+        verify_window = types.SimpleNamespace(
+            positions_2d=torch.tensor(
+                [[10, 11, 12], [20, 21, 22]], dtype=torch.int64
+            ),
+            verify_cache_loc=torch.tensor(
+                [100, 101, 102, 200, 201, 202], dtype=torch.int64
+            ),
+        )
+        verify_ids_2d = torch.tensor(
+            [[1, 2, 3], [4, 5, 6]], dtype=torch.int64
+        )
+        return verify_window, verify_ids_2d
+
+    def test_full_width_reuses_strided_window_without_builder(self):
+        executor = self._executor()
+        verify_window, verify_ids_2d = self._inputs()
+        layout = types.SimpleNamespace(
+            verify_lens=torch.tensor([3, 3], dtype=torch.int32),
+            verify_lens_cpu=[3, 3],
+            total_verify_tokens=6,
+            graph_num_tokens=6,
+        )
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify."
+            "BuildRaggedVerifyWindow.execute"
+        ) as build_window:
+            result, hidden = executor.run_compact(
+                batch=object(),
+                layout=layout,
+                verify_window=verify_window,
+                verify_ids_2d=verify_ids_2d,
+                draft_block_ids=torch.tensor([[1], [4]], dtype=torch.int64),
+                draft_tokens=torch.tensor(
+                    [[2, 3], [5, 6]], dtype=torch.int64
+                ),
+                bs=2,
+                device="cpu",
+                sampling_info=None,
+            )
+
+        self.assertIsNone(hidden)
+        self.assertIsNone(result.logits_output)
+        build_window.assert_not_called()
+        ragged_window = executor._run_ragged.call_args.kwargs["ragged_window"]
+        torch.testing.assert_close(
+            ragged_window.positions, verify_window.positions_2d.reshape(-1)
+        )
+        torch.testing.assert_close(
+            ragged_window.verify_cache_loc, verify_window.verify_cache_loc
+        )
+        torch.testing.assert_close(
+            ragged_window.verify_ids, verify_ids_2d.reshape(-1)
+        )
+        self.assertEqual(
+            ragged_window.positions.data_ptr(),
+            verify_window.positions_2d.data_ptr(),
+        )
+        self.assertIs(
+            ragged_window.verify_cache_loc,
+            verify_window.verify_cache_loc,
+        )
+        self.assertEqual(
+            ragged_window.verify_ids.data_ptr(),
+            verify_ids_2d.data_ptr(),
+        )
+
+    def test_short_lens_in_full_bucket_uses_builder(self):
+        executor = self._executor()
+        verify_window, verify_ids_2d = self._inputs()
+        layout = types.SimpleNamespace(
+            verify_lens=torch.tensor([2, 3], dtype=torch.int32),
+            verify_lens_cpu=[2, 3],
+            total_verify_tokens=5,
+            graph_num_tokens=6,
+        )
+        built_window = object()
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify."
+            "BuildRaggedVerifyWindow.execute",
+            return_value=built_window,
+        ) as build_window:
+            executor.run_compact(
+                batch=object(),
+                layout=layout,
+                verify_window=verify_window,
+                verify_ids_2d=verify_ids_2d,
+                draft_block_ids=torch.tensor([[1], [4]], dtype=torch.int64),
+                draft_tokens=torch.tensor(
+                    [[2, 3], [5, 6]], dtype=torch.int64
+                ),
+                bs=2,
+                device="cpu",
+                sampling_info=None,
+            )
+
+        build_window.assert_called_once()
+        self.assertIs(
+            executor._run_ragged.call_args.kwargs["ragged_window"],
+            built_window,
+        )
+
+    def test_missing_host_metadata_uses_builder(self):
+        executor = self._executor()
+        verify_window, verify_ids_2d = self._inputs()
+        layout = types.SimpleNamespace(
+            verify_lens=torch.tensor([3, 3], dtype=torch.int32),
+            verify_lens_cpu=None,
+            total_verify_tokens=None,
+            graph_num_tokens=6,
+        )
+        built_window = object()
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify."
+            "BuildRaggedVerifyWindow.execute",
+            return_value=built_window,
+        ) as build_window:
+            executor.run_compact(
+                batch=object(),
+                layout=layout,
+                verify_window=verify_window,
+                verify_ids_2d=verify_ids_2d,
+                draft_block_ids=torch.tensor([[1], [4]], dtype=torch.int64),
+                draft_tokens=torch.tensor(
+                    [[2, 3], [5, 6]], dtype=torch.int64
+                ),
+                bs=2,
+                device="cpu",
+                sampling_info=None,
+            )
+
+        build_window.assert_called_once()
+        self.assertIs(
+            executor._run_ragged.call_args.kwargs["ragged_window"],
+            built_window,
+        )
+
+
+class TestTargetVerifyExecutorRaggedSeqLens(CustomTestCase):
+    @staticmethod
+    def _run(*, backend_self_adds_seq_lens: bool):
+        executor = object.__new__(TargetVerifyExecutor)
+        executor.verify_num_draft_tokens = 3
+        executor._verify_backend_self_adds_seq_lens = mock.Mock(
+            return_value=backend_self_adds_seq_lens
+        )
+
+        seq_lens_cpu = torch.tensor([10, 20], dtype=torch.int64)
+        batch = types.SimpleNamespace(
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_sum=30,
+            out_cache_loc=None,
+        )
+        verify_lens = mock.Mock()
+        verify_lens.cpu.return_value.tolist.return_value = [2, 3]
+        layout = types.SimpleNamespace(
+            verify_lens=verify_lens,
+            verify_lens_cpu=None,
+        )
+        ragged_window = types.SimpleNamespace(
+            verify_ids=torch.tensor([1, 2, 3, 4, 5]),
+            positions=torch.tensor([10, 11, 20, 21, 22]),
+            verify_cache_loc=torch.tensor([100, 101, 200, 201, 202]),
+        )
+        result = TargetVerifyResult(
+            logits_output=None,
+            can_run_cuda_graph=True,
+        )
+        seen = {}
+
+        def forward_prepared_verify(
+            *,
+            batch,
+            verify_input,
+            seq_lens_cpu_backup,
+            seq_lens_sum_backup,
+            pp_proxy_tensors,
+        ):
+            seen["seq_lens_cpu"] = batch.seq_lens_cpu.clone()
+            seen["seq_lens_sum"] = batch.seq_lens_sum
+            seen["verify_input"] = verify_input
+            seen["pp_proxy_tensors"] = pp_proxy_tensors
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
+            return result
+
+        executor._forward_prepared_verify = mock.Mock(
+            side_effect=forward_prepared_verify
+        )
+        proxy = object()
+        actual = executor._run_ragged(
+            batch=batch,
+            layout=layout,
+            ragged_window=ragged_window,
+            sampling_info=None,
+            pp_proxy_tensors=proxy,
+        )
+        return types.SimpleNamespace(
+            actual=actual,
+            expected=result,
+            executor=executor,
+            batch=batch,
+            original_seq_lens_cpu=seq_lens_cpu,
+            layout=layout,
+            ragged_window=ragged_window,
+            verify_lens=verify_lens,
+            proxy=proxy,
+            seen=seen,
+        )
+
+    def test_self_adding_backend_skips_verify_lens_cpu_and_cpu_mirror_update(self):
+        case = self._run(backend_self_adds_seq_lens=True)
+
+        self.assertIs(case.actual, case.expected)
+        case.executor._verify_backend_self_adds_seq_lens.assert_called_once_with()
+        case.verify_lens.cpu.assert_not_called()
+        torch.testing.assert_close(
+            case.seen["seq_lens_cpu"],
+            case.original_seq_lens_cpu,
+        )
+        self.assertEqual(case.seen["seq_lens_sum"], 30)
+        self.assertIs(case.batch.seq_lens_cpu, case.original_seq_lens_cpu)
+        self.assertEqual(case.batch.seq_lens_sum, 30)
+        self.assertIs(
+            case.seen["verify_input"].ragged_verify_layout,
+            case.layout,
+        )
+        self.assertIs(case.batch.out_cache_loc, case.ragged_window.verify_cache_loc)
+        self.assertIs(case.seen["pp_proxy_tensors"], case.proxy)
+
+    def test_non_self_adding_backend_preserves_cpu_mirror_update(self):
+        case = self._run(backend_self_adds_seq_lens=False)
+
+        self.assertIs(case.actual, case.expected)
+        case.executor._verify_backend_self_adds_seq_lens.assert_called_once_with()
+        case.verify_lens.cpu.assert_called_once_with()
+        torch.testing.assert_close(
+            case.seen["seq_lens_cpu"],
+            torch.tensor([12, 23], dtype=torch.int64),
+        )
+        self.assertEqual(case.seen["seq_lens_sum"], 35)
+        self.assertIs(case.batch.seq_lens_cpu, case.original_seq_lens_cpu)
+        self.assertEqual(case.batch.seq_lens_sum, 30)
+        self.assertIs(
+            case.seen["verify_input"].ragged_verify_layout,
+            case.layout,
+        )
+        self.assertIs(case.batch.out_cache_loc, case.ragged_window.verify_cache_loc)
+        self.assertIs(case.seen["pp_proxy_tensors"], case.proxy)
 
 
 class TestDSparkPPDynamicVerifyPlan(CustomTestCase):
@@ -392,17 +1637,26 @@ class TestDSparkPPDynamicVerifyPlan(CustomTestCase):
                 pp_hidden_states_proxy_tensors=proxy_out,
             )
         )
+        verify_window = types.SimpleNamespace(
+            positions_2d=torch.arange(6, dtype=torch.int64).view(1, 6),
+            verify_cache_loc=torch.arange(100, 106, dtype=torch.int64),
+        )
+        verify_ids_2d = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.int64)
 
         with mock.patch(
             "sglang.srt.speculative.dspark_components.dspark_verify."
-            "BuildRaggedVerifyWindow.execute",
-            return_value=object(),
-        ):
+            "BuildRaggedVerifyWindow.execute"
+        ) as build_window:
             result, hidden = executor.run_compact(
                 batch=object(),
                 layout=types.SimpleNamespace(
-                    verify_lens=torch.tensor([2], dtype=torch.int32)
+                    verify_lens=torch.tensor([6], dtype=torch.int32),
+                    verify_lens_cpu=[6],
+                    total_verify_tokens=6,
+                    graph_num_tokens=6,
                 ),
+                verify_window=verify_window,
+                verify_ids_2d=verify_ids_2d,
                 draft_block_ids=torch.tensor([[1]], dtype=torch.int64),
                 draft_tokens=torch.tensor([[2, 3, 4, 5, 6]], dtype=torch.int64),
                 bs=1,
@@ -411,6 +1665,7 @@ class TestDSparkPPDynamicVerifyPlan(CustomTestCase):
                 pp_proxy_tensors=proxy_in,
             )
 
+        build_window.assert_not_called()
         self.assertIsNone(hidden)
         self.assertIs(result.pp_hidden_states_proxy_tensors, proxy_out)
         self.assertIs(

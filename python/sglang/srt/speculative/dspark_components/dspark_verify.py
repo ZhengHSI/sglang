@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import List, Optional, Tuple
 
 import msgspec
@@ -21,7 +21,10 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     compute_dflash_sampling_correct_drafts_and_bonus,
 )
-from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockResult,
+    sync_dspark_tensor_across_tp,
+)
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -53,6 +56,50 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
 _PP_FAST_REJECTION_LOGGED = False
+
+
+def _sync_accept_across_tp(
+    correct_len: torch.Tensor,
+    bonus: torch.Tensor,
+    cap_trim_lens: torch.Tensor,
+    *,
+    packed_buf: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Make rank zero's coherent accept outcome authoritative within TP."""
+    bs = correct_len.shape[0]
+    if packed_buf is None:
+        packed = torch.stack(
+            (
+                correct_len.to(torch.int64),
+                bonus.to(torch.int64),
+                cap_trim_lens.to(torch.int64),
+            )
+        )
+    else:
+        if (
+            packed_buf.dtype != torch.int64
+            or packed_buf.ndim != 2
+            or packed_buf.shape[0] != 3
+            or packed_buf.shape[1] < bs
+            or not packed_buf.is_contiguous()
+        ):
+            raise ValueError(
+                "DSpark accept synchronization buffer must be contiguous "
+                "int64 [3, max_bs]."
+            )
+        packed_buf[0, :bs].copy_(correct_len)
+        packed_buf[1, :bs].copy_(bonus)
+        packed_buf[2, :bs].copy_(cap_trim_lens)
+        # Broadcast the fixed-size allocation. A [:, :bs] slice is
+        # non-contiguous when bs < max_bs, and a temporary graph-pool tensor
+        # can be recycled before an external PyNCCL node has finished with it.
+        packed = packed_buf
+    sync_dspark_tensor_across_tp(packed)
+    return (
+        packed[0, :bs].to(correct_len.dtype),
+        packed[1, :bs].to(bonus.dtype),
+        packed[2, :bs].to(cap_trim_lens.dtype),
+    )
 
 
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
@@ -161,6 +208,20 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
                     value, dtype=dtype, device=device
                 )
         return payload
+
+    def to_serializable_dict(self) -> dict:
+        """Return one CPU metadata object for the PP output ring.
+
+        DSpark's per-request relay is tiny. Serializing it as one object avoids
+        overlapping a variable number of asynchronous GPU tensor sends with
+        the next PP proxy message when multiple microbatches are active.
+        """
+        return {
+            "pp_spec_output": {
+                field.name: self._to_list(getattr(self, field.name))
+                for field in fields(self)
+            }
+        }
 
     @classmethod
     def from_pp_outputs(cls, pp_outputs):
@@ -395,6 +456,11 @@ class TargetVerifyExecutor:
             correct_len = self._simulated_correct_len(
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
             )
+        correct_len, bonus, cap_trim_lens = _sync_accept_across_tp(
+            correct_len,
+            bonus,
+            cap_trim_lens,
+        )
 
         finalized = FinalizeAcceptLens.execute(
             correct_len=correct_len,
@@ -617,16 +683,17 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
-            verify_lens_cpu = (
-                layout.verify_lens_cpu
-                if layout.verify_lens_cpu is not None
-                else layout.verify_lens.cpu().tolist()
-            )
-            batch.seq_lens_cpu = seq_lens_cpu_backup + torch.tensor(
-                verify_lens_cpu, dtype=seq_lens_cpu_backup.dtype
-            )
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        if not self._verify_backend_self_adds_seq_lens():
+            if seq_lens_cpu_backup is not None:
+                verify_lens_cpu = (
+                    layout.verify_lens_cpu
+                    if layout.verify_lens_cpu is not None
+                    else layout.verify_lens.cpu().tolist()
+                )
+                batch.seq_lens_cpu = seq_lens_cpu_backup + torch.tensor(
+                    verify_lens_cpu, dtype=seq_lens_cpu_backup.dtype
+                )
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
         return self._forward_prepared_verify(
             batch=batch,
@@ -641,6 +708,8 @@ class TargetVerifyExecutor:
         *,
         batch: ScheduleBatch,
         layout: RaggedVerifyLayout,
+        verify_window: VerifyWindow,
+        verify_ids_2d: torch.Tensor,
         draft_block_ids: torch.Tensor,
         draft_tokens: torch.Tensor,
         bs: int,
@@ -649,16 +718,34 @@ class TargetVerifyExecutor:
         inject_gate: bool = False,
         pp_proxy_tensors=None,
     ) -> tuple[TargetVerifyResult, Optional[torch.Tensor]]:
-        ragged_window = BuildRaggedVerifyWindow.execute(
-            batch=batch,
-            layout=layout,
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            bs=bs,
-            device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
+        stride = self.verify_num_draft_tokens
+        full_tokens = bs * stride
+        verify_lens_cpu = layout.verify_lens_cpu
+        full_width = (
+            verify_lens_cpu is not None
+            and len(verify_lens_cpu) == bs
+            and all(int(length) == stride for length in verify_lens_cpu)
+            and layout.total_verify_tokens == full_tokens
+            and layout.graph_num_tokens == full_tokens
         )
+        if full_width:
+            assert tuple(verify_ids_2d.shape) == (bs, stride)
+            ragged_window = RaggedVerifyWindow(
+                positions=verify_window.positions_2d.reshape(-1),
+                verify_cache_loc=verify_window.verify_cache_loc,
+                verify_ids=verify_ids_2d.reshape(-1),
+            )
+        else:
+            ragged_window = BuildRaggedVerifyWindow.execute(
+                batch=batch,
+                layout=layout,
+                draft_block_ids=draft_block_ids,
+                draft_tokens=draft_tokens,
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=stride,
+                model_runner=self.model_runner,
+            )
         if self.verify_epilogue is not None:
             self.verify_epilogue.begin_step(layout.verify_lens, armed=inject_gate)
         target_verify = self._run_ragged(
@@ -672,7 +759,6 @@ class TargetVerifyExecutor:
         if logits_output is None:
             return target_verify, None
 
-        stride = self.verify_num_draft_tokens
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
             strided_logits = self.verify_epilogue.strided_logits
             hidden_strided = self.verify_epilogue.strided_hidden
@@ -745,11 +831,16 @@ class DsparkVerifyEpilogue:
         verify_num_draft_tokens: int,
         device,
         commit_ctx: Optional[CommitInjectCtx] = None,
+        fold_accept: bool = True,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
+        # This controls capture-time graph topology. Keep it private and
+        # expose only a read-only capability below so replay-time dispatch
+        # cannot diverge from the graph that was actually recorded.
+        self._fold_accept = bool(fold_accept)
         self.inject_gate_buf = torch.zeros((1,), dtype=torch.int32, device=device)
         self.verify_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int64, device=device
@@ -759,6 +850,9 @@ class DsparkVerifyEpilogue:
         )
         self.correct_len_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int64, device=device
+        )
+        self.accept_sync_buf = torch.zeros(
+            (3, self.max_bs), dtype=torch.int64, device=device
         )
         self.bonus_buf = torch.zeros((self.max_bs,), dtype=torch.int64, device=device)
         self.cap_trim_lens_buf = torch.zeros(
@@ -815,8 +909,12 @@ class DsparkVerifyEpilogue:
         )
 
     @property
+    def folds_accept(self) -> bool:
+        return self._fold_accept
+
+    @property
     def folds_commit(self) -> bool:
-        if self.commit_ctx is None:
+        if not self.folds_accept or self.commit_ctx is None:
             return False
         pool = self.commit_ctx.resolve_pool()
         return hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")
@@ -855,6 +953,8 @@ class DsparkVerifyEpilogue:
         self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
         verify_lens = self.verify_lens_buf[:bs]
         self._scatter(compact_logits, compact_hidden, verify_lens, bs)
+        if not self.folds_accept:
+            return
         commit_lens = self._accept(input_ids, seq_lens, verify_lens, bs)
         if self.folds_commit:
             self._commit_inject(
@@ -862,12 +962,21 @@ class DsparkVerifyEpilogue:
             )
 
     def _scatter(self, compact_logits, compact_hidden, verify_lens, bs: int) -> None:
+        verify_lens = verify_lens.to(dtype=torch.int64).contiguous()
+        start = (torch.cumsum(verify_lens, dim=0) - verify_lens).contiguous()
+        # A ragged graph tier can contain zero-length padding request slots.
+        # Scatter-only PP returns just the real-bs prefix and has no captured
+        # accept/commit consumer, so preserve those blocks instead of issuing
+        # vocab-wide fill stores. Folded accept keeps the fully-defined output.
+        skip_zero_lens = not self.folds_accept
         scatter_compact_to_strided_into(
             compact=compact_logits,
             verify_lens=verify_lens,
             out=self.strided_logits[: bs * self.stride],
             stride=self.stride,
             fill_value=0.0,
+            start=start,
+            skip_zero_lens=skip_zero_lens,
         )
         scatter_compact_to_strided_into(
             compact=compact_hidden,
@@ -875,6 +984,8 @@ class DsparkVerifyEpilogue:
             out=self.strided_hidden[: bs * self.stride],
             stride=self.stride,
             fill_value=0.0,
+            start=start,
+            skip_zero_lens=skip_zero_lens,
         )
 
     def _accept(self, input_ids, seq_lens, verify_lens, bs: int) -> torch.Tensor:
@@ -893,6 +1004,12 @@ class DsparkVerifyEpilogue:
             target_logits=self.strided_logits[: bs * self.stride],
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=verify_lens,
+        )
+        correct_len, bonus, cap_trim_lens = _sync_accept_across_tp(
+            correct_len,
+            bonus,
+            cap_trim_lens,
+            packed_buf=self.accept_sync_buf,
         )
         finalized = finalize_accept_lens_triton(
             correct_len=correct_len,

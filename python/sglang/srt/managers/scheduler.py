@@ -66,7 +66,11 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_seed_metadata_dim,
     prepare_abort,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_pp_output_group,
+    get_world_group,
+)
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
@@ -910,6 +914,7 @@ class Scheduler(
         self.attn_cp_group = get_parallel().attn_cp_group
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
+        self.pp_output_group = get_pp_output_group()
         self.world_group = get_world_group()
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).

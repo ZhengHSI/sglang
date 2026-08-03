@@ -12,6 +12,7 @@ from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_
 
 _BLOCK_V = 1024
 _IDX_SENTINEL = tl.constexpr(2147483647)
+_FLOAT32_TINY = tl.constexpr(1.1754943508222875e-38)
 
 
 class SampleStepTokens:
@@ -142,6 +143,7 @@ def _online_partial_kernel(
     tile_max = tl.max(s, axis=0)
     greedy = tl.load(greedy_mask_ptr + row) != 0
     noise = tl.load(exp_noise_ptr + row * V + offs, mask=mask, other=1.0)
+    noise = tl.maximum(noise, _FLOAT32_TINY)
     denom = tl.where(greedy, 1.0, noise)
     key = tl.exp(s - tile_max) / denom
     key = tl.where(mask, key, -1.0)
@@ -176,7 +178,9 @@ def _online_combine_kernel(
     rescaled = tl.where(mask, rescaled, -1.0)
     best = tl.max(rescaled, axis=0)
     cand = tl.where(rescaled == best, idxs, _IDX_SENTINEL)
-    tl.store(next_tokens_ptr + row, tl.min(cand, axis=0).to(tl.int64))
+    next_token = tl.min(cand, axis=0)
+    next_token = tl.where(next_token == _IDX_SENTINEL, 0, next_token)
+    tl.store(next_tokens_ptr + row, next_token.to(tl.int64))
 
 
 def sample_step_tokens_triton(

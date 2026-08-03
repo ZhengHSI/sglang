@@ -79,6 +79,7 @@ def test_parallel_group_construction_tp8_attn_cp2():
         patch.object(parallel_state, "_ATTN_CP", None),
         patch.object(parallel_state, "_ATTN_TP", None),
         patch.object(parallel_state, "_PP", None),
+        patch.object(parallel_state, "_PP_OUTPUT", None),
         patch("torch.distributed.is_initialized", return_value=True),
         patch("torch.distributed.get_world_size", return_value=world_size),
         patch("torch.distributed.get_rank", return_value=0),
@@ -118,6 +119,11 @@ def test_parallel_group_construction_tp8_attn_cp2():
                 pipeline_model_parallel_size=1,
                 attention_context_model_parallel_size=2,
             )
+            assert (
+                parallel_state.get_pp_output_group()
+                is parallel_state.get_pp_group()
+            )
+            assert "pp_output" not in created_groups
 
             # Verify TP groups
             tp_groups = created_groups.get("tp", [])
@@ -179,6 +185,7 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
         patch.object(parallel_state, "_MOE_DP", None),
         patch.object(parallel_state, "_MOE_TP", None),
         patch.object(parallel_state, "_PP", None),
+        patch.object(parallel_state, "_PP_OUTPUT", None),
         patch("torch.distributed.is_initialized", return_value=True),
         patch("torch.distributed.get_world_size", return_value=world_size),
         patch("torch.distributed.get_rank", return_value=0),
@@ -268,6 +275,76 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             parallel_state.destroy_model_parallel()
 
 
+def test_pp2_builds_distinct_proxy_and_output_groups():
+    world_size = 16
+
+    with (
+        patch.object(parallel_state, "_WORLD", None),
+        patch.object(parallel_state, "_TP", None),
+        patch.object(parallel_state, "_ATTN_CP", None),
+        patch.object(parallel_state, "_ATTN_TP", None),
+        patch.object(parallel_state, "_DCP", None),
+        patch.object(parallel_state, "_MOE_DP", None),
+        patch.object(parallel_state, "_MOE_EP", None),
+        patch.object(parallel_state, "_MOE_TP", None),
+        patch.object(parallel_state, "_PP", None),
+        patch.object(parallel_state, "_PP_OUTPUT", None),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=world_size),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.get_backend", return_value="nccl"),
+    ):
+        created_groups = {}
+        created_kwargs = {}
+
+        def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
+            group_name = kwargs.get("group_name", "unknown")
+            created_groups[group_name] = group_ranks
+            created_kwargs[group_name] = kwargs
+            mock_group = Mock()
+            mock_group.device_group = Mock()
+            return mock_group
+
+        with (
+            patch.object(
+                parallel_state,
+                "init_model_parallel_group",
+                side_effect=mock_init_model_parallel_group,
+            ),
+            patch.object(parallel_state, "get_world_group") as mock_world_group,
+        ):
+            mock_world = Mock()
+            mock_world.device_group = Mock()
+            mock_world.local_rank = 0
+            mock_world_group.return_value = mock_world
+
+            parallel_state.initialize_model_parallel(
+                tensor_model_parallel_size=8,
+                pipeline_model_parallel_size=2,
+            )
+
+            expected_pp_groups = [
+                [0, 8],
+                [1, 9],
+                [2, 10],
+                [3, 11],
+                [4, 12],
+                [5, 13],
+                [6, 14],
+                [7, 15],
+            ]
+            assert created_groups["pp"] == expected_pp_groups
+            assert created_groups["pp_output"] == expected_pp_groups
+            assert (
+                parallel_state.get_pp_output_group()
+                is not parallel_state.get_pp_group()
+            )
+            assert created_kwargs["pp_output"]["use_pynccl"] is False
+            assert created_kwargs["pp_output"]["use_custom_allreduce"] is False
+
+            parallel_state.destroy_model_parallel()
+
+
 if __name__ == "__main__":
     # Run tests without requiring GPUs
     import sys
@@ -275,6 +352,7 @@ if __name__ == "__main__":
     try:
         test_parallel_group_construction_tp8_attn_cp2()
         test_parallel_group_construction_tp8_moe_ep4_cp2()
+        test_pp2_builds_distinct_proxy_and_output_groups()
 
         sys.exit(0)
     except AssertionError as e:

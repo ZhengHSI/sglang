@@ -770,8 +770,16 @@ class SchedulerBatchResultProcessor:
         accept_lens_cpu = None
         if isinstance(batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)):
             pp_raw = batch.spec_info
-            accept_lens_cpu = torch.tensor(pp_raw.accept_lens, dtype=torch.int64)
-            accept_lens = accept_lens_cpu.to(batch.seq_lens.device)
+            # PP relay tensors stay on the device. Reuse the result's existing
+            # synchronized D2H copy for the CPU mirror instead of constructing a
+            # misleadingly named CUDA tensor with torch.tensor(pp_raw.accept_lens).
+            accept_lens = torch.as_tensor(
+                pp_raw.accept_lens,
+                dtype=torch.int64,
+                device=batch.seq_lens.device,
+            )
+            accept_lens_cpu = result.accept_lens
+            assert accept_lens_cpu is not None and accept_lens_cpu.is_cpu
             if pp_raw.accept_index is not None:
                 accept_index = torch.tensor(
                     pp_raw.accept_index,

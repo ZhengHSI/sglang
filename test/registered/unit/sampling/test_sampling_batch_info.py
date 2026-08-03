@@ -326,6 +326,41 @@ class TestFilterBatch(CustomTestCase):
         info.filter_batch([1], keep)
         self.assertIsNone(info.sampling_seed)
 
+    def test_filter_forward_copy_without_penalizer_orchestrator(self):
+        """Forward-only sampling info can still be split into smaller groups."""
+        orch = MagicMock(is_required=True)
+        additive_penalties = torch.arange(3 * VOCAB_SIZE, dtype=torch.float32).view(
+            3, VOCAB_SIZE
+        )
+        scaling_penalties = torch.tensor([[1.0], [2.0], [3.0]]).expand(
+            3, VOCAB_SIZE
+        )
+        orch.accumulate_additive_penalties.side_effect = (
+            lambda output: output.copy_(additive_penalties)
+        )
+        orch.accumulate_scaling_penalties.return_value = scaling_penalties
+        info = _make_info(batch_size=3, penalizer_orchestrator=orch)
+        info.temperatures = torch.tensor([[0.7], [0.8], [0.9]])
+        info.top_ks = torch.tensor([8, 16, 32], dtype=torch.int32)
+        forwarded = info.copy_for_forward()
+
+        keep = torch.tensor([0, 2])
+        forwarded.filter_batch([0, 2], keep)
+
+        self.assertIsNone(forwarded.penalizer_orchestrator)
+        torch.testing.assert_close(
+            forwarded.temperatures, torch.tensor([[0.7], [0.9]])
+        )
+        torch.testing.assert_close(
+            forwarded.top_ks, torch.tensor([8, 32], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            forwarded.acc_additive_penalties, additive_penalties[[0, 2]]
+        )
+        torch.testing.assert_close(
+            forwarded.acc_scaling_penalties, scaling_penalties[[0, 2]]
+        )
+
 
 # merge_batch
 class TestMergeBatch(CustomTestCase):

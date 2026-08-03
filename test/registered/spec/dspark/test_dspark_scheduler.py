@@ -1,11 +1,13 @@
 import functools
 import types
 import unittest
+from unittest import mock
 
 import torch
 
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
+    DSparkVerifyPlanner,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
@@ -18,7 +20,11 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
 from sglang.srt.speculative.dspark_components.kernels.dspark_schedule import (
     schedule_verify_lens_topk_from_survival,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    RaggedVerifyMode,
+    compute_target_verify_graph_key,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -484,12 +490,161 @@ def _fake_model_runner(capture_num_tokens, max_bs):
     return types.SimpleNamespace(decode_cuda_graph_runner=runner)
 
 
+def _tier_alignment_planner(
+    *,
+    align_verify_tokens_to_graph_tier: bool,
+    survival_eps: float = 1e-6,
+) -> DSparkVerifyPlanner:
+    planner = object.__new__(DSparkVerifyPlanner)
+    planner.verify_num_draft_tokens = 6
+    planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
+    planner._schedule_cfg = DSparkScheduleConfig(
+        gamma=5,
+        survival_eps=survival_eps,
+    )
+    planner._budget_planner = object()
+    planner._is_verify_all = False
+    planner._uniform_layout_cache = {}
+    planner._dynamic_graph_tier = True
+    planner._align_verify_tokens_to_graph_tier = (
+        align_verify_tokens_to_graph_tier
+    )
+    planner.model_runner = _fake_model_runner(
+        capture_num_tokens=[6, 12, 18, 24, 30, 36, 42, 48],
+        max_bs=8,
+    )
+    planner.server_args = types.SimpleNamespace(tp_size=1)
+    return planner
+
+
+def _schedule_tier_aligned_layout(
+    *,
+    planner: DSparkVerifyPlanner,
+    bs: int,
+    confidence: torch.Tensor,
+    budget: int,
+) -> RaggedVerifyLayout:
+    with mock.patch(
+        "sglang.srt.speculative.dspark_components.dspark_planner."
+        "verify_lens_broadcast_group",
+        return_value=(None, 1),
+    ):
+        layout = planner.schedule_layout(
+            req_pool_indices=torch.arange(bs, dtype=torch.int64),
+            prefix_lens=torch.zeros(bs, dtype=torch.int64),
+            device=torch.device("cpu"),
+            confidence=confidence,
+            budget=budget,
+        )
+    assert layout is not None
+    return layout
+
+
+class TestGraphTierAlignmentPlanner(CustomTestCase):
+    def test_flag_off_preserves_original_budget_schedule(self):
+        bs, budget = 4, 2
+        confidence = torch.full((bs, 5), 0.99, dtype=torch.float32)
+        planner = _tier_alignment_planner(
+            align_verify_tokens_to_graph_tier=False
+        )
+
+        layout = _schedule_tier_aligned_layout(
+            planner=planner,
+            bs=bs,
+            confidence=confidence,
+            budget=budget,
+        )
+        expected_lens = schedule_verify_lens_topk_from_survival(
+            survival_probs=_survival_from_confidence(confidence),
+            budget=budget,
+            cfg=planner._schedule_cfg,
+        )
+
+        self.assertTrue(torch.equal(layout.verify_lens, expected_lens))
+        self.assertEqual(int(layout.verify_lens.sum().item()), bs + budget)
+        self.assertEqual(
+            compute_target_verify_graph_key(
+                bs=bs,
+                num_draft_tokens=planner.verify_num_draft_tokens,
+                ragged_layout=layout,
+            ),
+            (6, 6),
+        )
+
+    def test_flag_on_fills_existing_graph_tier_without_changing_key(self):
+        cases = (
+            (1, 2, 6),
+            (4, 5, 12),
+            (8, 9, 18),
+        )
+        for bs, budget, expected_tier in cases:
+            with self.subTest(bs=bs, budget=budget):
+                confidence = torch.full((bs, 5), 0.99, dtype=torch.float32)
+                baseline = _schedule_tier_aligned_layout(
+                    planner=_tier_alignment_planner(
+                        align_verify_tokens_to_graph_tier=False
+                    ),
+                    bs=bs,
+                    confidence=confidence,
+                    budget=budget,
+                )
+                aligned = _schedule_tier_aligned_layout(
+                    planner=_tier_alignment_planner(
+                        align_verify_tokens_to_graph_tier=True
+                    ),
+                    bs=bs,
+                    confidence=confidence,
+                    budget=budget,
+                )
+
+                baseline_key = compute_target_verify_graph_key(
+                    bs=bs,
+                    num_draft_tokens=6,
+                    ragged_layout=baseline,
+                )
+                aligned_key = compute_target_verify_graph_key(
+                    bs=bs,
+                    num_draft_tokens=6,
+                    ragged_layout=aligned,
+                )
+                self.assertEqual(baseline_key, (expected_tier, expected_tier))
+                self.assertEqual(aligned_key, baseline_key)
+                self.assertEqual(
+                    int(aligned.verify_lens.sum().item()), expected_tier
+                )
+                self.assertGreaterEqual(int(aligned.verify_lens.min().item()), 1)
+                self.assertLessEqual(int(aligned.verify_lens.max().item()), 6)
+
+    def test_alignment_does_not_fill_with_survival_below_epsilon(self):
+        bs, budget = 4, 1
+        confidence = torch.full((bs, 5), 1e-8, dtype=torch.float32)
+        planner = _tier_alignment_planner(
+            align_verify_tokens_to_graph_tier=True,
+            survival_eps=1e-6,
+        )
+
+        layout = _schedule_tier_aligned_layout(
+            planner=planner,
+            bs=bs,
+            confidence=confidence,
+            budget=budget,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                layout.verify_lens,
+                torch.ones(bs, dtype=torch.int32),
+            )
+        )
+        self.assertEqual(int(layout.verify_lens.sum().item()), bs)
+        self.assertEqual(layout.graph_num_tokens, 6)
+
+
 class TestBudgetTierSelection(CustomTestCase):
     def test_floor_uses_tier_hint_capped_at_uniform_window(self):
         from sglang.srt.speculative.dspark_components.dspark_planner import (
             verify_layout_graph_num_tokens_floor,
         )
-        from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
 
         model_runner = _fake_model_runner([8, 16, 1024], max_bs=128)
         floor = verify_layout_graph_num_tokens_floor(

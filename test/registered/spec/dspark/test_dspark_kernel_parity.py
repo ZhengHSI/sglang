@@ -267,13 +267,16 @@ def _case_compact_layout(tc):
             padded_total=padded_total,
             device=DEVICE,
         )
-        tc._parity(
-            dspark_verify_window.CompactVerifyIds,
-            draft_block_ids=_ri(0, VOCAB, (bs, gamma)),
-            draft_tokens=_ri(0, VOCAB, (bs, gamma)),
-            layout=_layout(verify_lens, padded_total),
-            device=DEVICE,
-        )
+        # PP relay carries one anchor per request while the standalone draft
+        # path may retain the full block. Both layouts must address row 0 only.
+        for anchor_width in (1, gamma):
+            tc._parity(
+                dspark_verify_window.CompactVerifyIds,
+                draft_block_ids=_ri(0, VOCAB, (bs, anchor_width)),
+                draft_tokens=_ri(0, VOCAB, (bs, gamma)),
+                layout=_layout(verify_lens, padded_total),
+                device=DEVICE,
+            )
 
 
 def _case_swa_page_indices(tc):
@@ -449,6 +452,49 @@ def _case_sample_step_tokens(tc):
         cls.triton(step_logits=view, **kw),
         cls.triton(step_logits=view.contiguous(), **kw),
     )
+    # Exp(1) can return zero. Match the clamped Gumbel-race convention used
+    # by spec_utils.fast_sample instead of allowing inf/NaN scores.
+    logits = torch.zeros(1, 2050, device=DEVICE)
+    logits[0, 0] = 1000.0
+    noise = torch.ones(1, 2050, device=DEVICE)
+    noise[0, 1024] = 0.0
+    temperatures = torch.ones(1, device=DEVICE)
+    greedy_mask = torch.zeros(1, dtype=torch.bool, device=DEVICE)
+    clamped_noise = noise.clone().clamp_min_(torch.finfo(torch.float32).tiny)
+    expected = cls.torch(
+        step_logits=logits,
+        temperatures=temperatures,
+        greedy_mask=greedy_mask,
+        exp_noise=clamped_noise,
+    )
+    sampled = cls.triton(
+        step_logits=logits,
+        temperatures=temperatures,
+        greedy_mask=greedy_mask,
+        exp_noise=noise,
+    )
+    tc._eq(sampled, expected)
+    tc.assertTrue(((sampled >= 0) & (sampled < logits.shape[-1])).all().item())
+
+    # Non-finite logits are invalid model output, but the internal reduction
+    # sentinel must never escape as a token id and crash the next embedding.
+    edge_logits = torch.full((3, 2050), float("-inf"), device=DEVICE)
+    edge_logits[1].fill_(float("nan"))
+    edge_logits[2].fill_(float("inf"))
+    sampled = cls.triton(
+        step_logits=edge_logits,
+        temperatures=torch.ones(3, device=DEVICE),
+        greedy_mask=torch.zeros(3, dtype=torch.bool, device=DEVICE),
+        exp_noise=torch.ones(3, 2050, device=DEVICE),
+    )
+    tc.assertTrue(
+        (
+            (sampled >= 0)
+            & (sampled < edge_logits.shape[-1])
+        )
+        .all()
+        .item()
+    )
 
 
 def _case_scatter_compact_to_strided(tc):
@@ -467,6 +513,44 @@ def _case_scatter_compact_to_strided(tc):
             fill_value=0.0,
             verify_num_draft_tokens=t,
         )
+
+    # The graph-captured PP scatter may leave zero-length padded request
+    # blocks untouched. Active blocks must still be fully defined, while the
+    # generic default keeps the historical fill-all behavior.
+    stride, dim = 3, 17
+    verify_lens = torch.tensor([2, 0, 1, 0], dtype=torch.int32, device=DEVICE)
+    start = torch.tensor([0, 2, 2, 3], dtype=torch.int64, device=DEVICE)
+    compact = torch.arange(3 * dim, dtype=torch.float32, device=DEVICE).view(
+        3, dim
+    )
+    sentinel = -7.0
+    out = torch.full((4 * stride, dim), sentinel, device=DEVICE)
+    dspark_verify_window.scatter_compact_to_strided_into(
+        compact=compact,
+        verify_lens=verify_lens,
+        out=out,
+        stride=stride,
+        fill_value=0.0,
+        start=start,
+        skip_zero_lens=True,
+    )
+    expected = torch.full_like(out, sentinel)
+    expected[:2].copy_(compact[:2])
+    expected[2].zero_()
+    expected[6].copy_(compact[2])
+    expected[7:9].zero_()
+    tc._eq(out, expected)
+
+    default_out = torch.full_like(out, sentinel)
+    dspark_verify_window.scatter_compact_to_strided_into(
+        compact=compact,
+        verify_lens=verify_lens,
+        out=default_out,
+        stride=stride,
+        fill_value=0.0,
+    )
+    tc._eq(default_out[3:6], torch.zeros_like(default_out[3:6]))
+    tc._eq(default_out[9:12], torch.zeros_like(default_out[9:12]))
 
 
 def _case_schedule_verify_lens_topk(tc):

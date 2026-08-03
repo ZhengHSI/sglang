@@ -7,6 +7,7 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
@@ -29,6 +30,27 @@ from sglang.srt.speculative.spec_utils import draft_tp_context
 
 logger = logging.getLogger(__name__)
 _DRAFT_TOPK_LOGGED = False
+
+
+def sync_dspark_tensor_across_tp(tensor: torch.Tensor) -> torch.Tensor:
+    """Broadcast a DSpark sampling result within the current PP stage's TP group."""
+    tp_group = get_tp_group()
+    if tp_group.world_size > 1:
+        tensor = tensor.contiguous()
+        if (
+            tensor.device.type == "cuda"
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            if tp_group.pynccl_comm is None:
+                raise RuntimeError(
+                    "DSpark TP synchronization requires PyNCCL during CUDA "
+                    "graph capture."
+                )
+            with tp_group.pynccl_comm.change_state(enable=True):
+                tp_group.pynccl_comm.broadcast(tensor, src=0)
+        else:
+            tp_group.broadcast(tensor, src=0)
+    return tensor
 
 
 class DraftBlockResult(msgspec.Struct, frozen=True):
@@ -56,7 +78,7 @@ class DraftProposal(msgspec.Struct, frozen=True):
 
 def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
     del step_idx
-    return torch.argmax(step_logits, dim=-1)
+    return sync_dspark_tensor_across_tp(torch.argmax(step_logits, dim=-1))
 
 
 class DsparkDraftSampler:
@@ -203,7 +225,9 @@ def sample_draft_block(
     if not any_sampling:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-            return torch.argmax(step_logits, dim=-1)
+            return sync_dspark_tensor_across_tp(
+                torch.argmax(step_logits, dim=-1)
+            )
 
     else:
 
@@ -219,31 +243,39 @@ def sample_draft_block(
                     dtype=torch.float32,
                     device=step_logits.device,
                 ).exponential_(1)
-                return SampleStepTokens.execute(
+                exp_noise.clamp_min_(torch.finfo(torch.float32).tiny)
+                sampled_tokens = SampleStepTokens.execute(
                     step_logits=step_logits,
                     temperatures=temperatures,
                     greedy_mask=greedy_mask,
                     exp_noise=exp_noise,
                     top_k=draft_top_k,
                 )
+            elif draft_top_k is not None:
+                topk_logits, topk_ids = torch.topk(
+                    step_logits, k=draft_top_k, dim=-1
+                )
+                probs = torch.softmax(
+                    topk_logits.float() / temperatures[:, None], dim=-1
+                )
+                sampled_pos = torch.multinomial(probs, num_samples=1)
+                sampled_tokens = topk_ids.gather(-1, sampled_pos).squeeze(-1)
+                argmax_tokens = torch.argmax(step_logits, dim=-1)
+                sampled_tokens = torch.where(
+                    greedy_mask, argmax_tokens, sampled_tokens
+                )
             else:
-                if draft_top_k is not None:
-                    topk_logits, topk_ids = torch.topk(
-                        step_logits, k=draft_top_k, dim=-1
-                    )
-                    probs = torch.softmax(
-                        topk_logits.float() / temperatures[:, None], dim=-1
-                    )
-                    sampled_pos = torch.multinomial(probs, num_samples=1)
-                    sampled_tokens = topk_ids.gather(-1, sampled_pos).squeeze(-1)
-                    argmax_tokens = torch.argmax(step_logits, dim=-1)
-                    return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
                 probs = torch.softmax(
                     step_logits.float() / temperatures[:, None], dim=-1
                 )
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-                return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
+                sampled_tokens = torch.where(
+                    greedy_mask, argmax_tokens, sampled_tokens
+                )
+            # The sampled token feeds the next Markov step. Synchronizing only
+            # after the whole block would leave later logits rank-divergent.
+            return sync_dspark_tensor_across_tp(sampled_tokens)
 
     draft_tokens, corrected_logits = markov_head.sample_block(
         base_logits,

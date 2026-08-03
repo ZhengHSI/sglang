@@ -1860,11 +1860,19 @@ def get_moe_tp_group() -> GroupCoordinator:
 get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
+_PP_OUTPUT: Optional[GroupCoordinator] = None
 
 
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
+
+
+def get_pp_output_group() -> GroupCoordinator:
+    assert (
+        _PP_OUTPUT is not None
+    ), "pipeline output model parallel group is not initialized"
+    return _PP_OUTPUT
 
 
 # kept for backward compatibility
@@ -2442,8 +2450,11 @@ def initialize_model_parallel(
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
-    global _PP
+    global _PP, _PP_OUTPUT
     assert _PP is None, "pipeline model parallel group is already initialized"
+    assert (
+        _PP_OUTPUT is None
+    ), "pipeline output model parallel group is already initialized"
     group_ranks = []
     for pp_group_idx in range(num_pipeline_model_parallel_groups):
         ranks = list(
@@ -2461,6 +2472,24 @@ def initialize_model_parallel(
         rank_offset=rank_offset,
         max_world_size=max_world_size,
     )
+    if pipeline_model_parallel_size == 1:
+        _PP_OUTPUT = _PP
+    else:
+        # Keep output tensors on a communicator distinct from PP proxy tensors.
+        # Both message classes use attn-TP send-slice/all-gather. If their P2P
+        # streams interleave differently across TP lanes, receiving the wrong
+        # class would enter a different TP collective before typed demux.
+        _PP_OUTPUT = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            group_name="pp_output",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
 
 
 def create_custom_parallel_group(
@@ -2690,7 +2719,10 @@ def destroy_model_parallel():
         _TP.destroy()
     _TP = None
 
-    global _PP
+    global _PP, _PP_OUTPUT
+    if _PP_OUTPUT and _PP_OUTPUT is not _PP:
+        _PP_OUTPUT.destroy()
+    _PP_OUTPUT = None
     if _PP:
         _PP.destroy()
     _PP = None
